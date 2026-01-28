@@ -30,8 +30,8 @@ except ImportError:
 
 
 # ================== CONFIG ==================
-DEST_IP = "10.190.49.118"   # IP del receptor
-DEST_PORT = 1162            # 162 o 1162
+DEST_IP = "192.168.1.69"   # IP del receptor
+DEST_PORT = 162            # 162 o 1162
 COMMUNITY = "public"
 
 # OID estándar: linkDown

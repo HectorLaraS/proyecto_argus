@@ -33,7 +33,7 @@ from pysnmp.carrier.asyncio.dgram import udp
 
 # ================== CONFIG ==================
 SNMP_LISTEN_IP = "0.0.0.0"
-SNMP_PORT = 1162          # 162 solo con permisos admin
+SNMP_PORT = 162          # 162 solo con permisos admin
 MAX_TRAPS = 200
 
 WEB_HOST = "0.0.0.0"
