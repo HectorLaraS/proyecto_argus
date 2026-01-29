@@ -1,16 +1,14 @@
 """
 SNMP Trap Sender simple (SNMP v2c) - PySNMP moderno
 --------------------------------------------------
-- Compatible con:
-  - UdpTransportTarget.create()
-  - sendNotification / send_notification
-  - add_varbinds (nuevo) en vez de addVarBinds
+Incluye IP de origen y destino como VarBinds.
 
 Uso:
   python trap_sender.py
 """
 
 import asyncio
+import socket
 
 from pysnmp.hlapi.asyncio import (
     SnmpEngine,
@@ -22,7 +20,7 @@ from pysnmp.hlapi.asyncio import (
     OctetString,
 )
 
-# Compatibilidad de nombre de función (camelCase vs snake_case)
+# Compatibilidad de nombre de función
 try:
     from pysnmp.hlapi.asyncio import sendNotification as send_notification_func
 except ImportError:
@@ -30,41 +28,54 @@ except ImportError:
 
 
 # ================== CONFIG ==================
-DEST_IP = "192.168.1.69"   # IP del receptor
-DEST_PORT = 162            # 162 o 1162
+DEST_IP = "192.168.0.19"
+DEST_PORT = 1162
 COMMUNITY = "public"
 
-# OID estándar: linkDown
-TRAP_OID = "1.3.6.1.6.3.1.1.5.3"
+# Trap estándar
+TRAP_OID = "1.3.6.1.6.3.1.1.5.3"  # linkDown
 
-# VarBind de prueba
-VAR_OID = "1.3.6.1.2.1.1.1.0"
-VAR_VALUE = "Trap enviado desde Python (PySNMP asyncio)"
+# OIDs informativos (enterprise / custom)
+OID_MESSAGE     = "1.3.6.1.4.1.99999.1.1"
+OID_SRC_IP      = "1.3.6.1.4.1.99999.1.2"
+OID_DEST_IP     = "1.3.6.1.4.1.99999.1.3"
+
+
+def get_source_ip(dest_ip: str) -> str:
+    """Obtiene la IP local usada para salir hacia dest_ip."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((dest_ip, 1))
+        return s.getsockname()[0]
+    finally:
+        s.close()
 
 
 async def send_trap():
+    src_ip = get_source_ip(DEST_IP)
+    dest_ip = DEST_IP
+
     target = await UdpTransportTarget.create((DEST_IP, DEST_PORT))
 
-    # En PySNMP moderno, este llamado suele devolver:
-    # (errorIndication, errorStatus, errorIndex, varBinds)
     res = await send_notification_func(
         SnmpEngine(),
-        CommunityData(COMMUNITY, mpModel=1),  # SNMP v2c
+        CommunityData(COMMUNITY, mpModel=1),
         target,
         ContextData(),
         "trap",
         NotificationType(ObjectIdentity(TRAP_OID)).add_varbinds(
-            (ObjectIdentity(VAR_OID), OctetString(VAR_VALUE))
+            (ObjectIdentity(OID_MESSAGE), OctetString("Trap de prueba ARGUS")),
+            (ObjectIdentity(OID_SRC_IP),  OctetString(src_ip)),
+            (ObjectIdentity(OID_DEST_IP), OctetString(dest_ip)),
         ),
     )
 
-    # Manejo robusto de retorno (por si alguna variante devuelve otra cosa)
     if isinstance(res, tuple) and len(res) == 4:
-        error_indication, error_status, error_index, var_binds = res
+        error_indication, error_status, error_index, _ = res
     else:
-        error_indication, error_status, error_index, var_binds = res, 0, 0, []
+        error_indication, error_status, error_index = res, 0, 0
 
-    if error_indication is not None:
+    if error_indication:
         print(f"Error enviando trap: {error_indication}")
         return
 
@@ -73,6 +84,8 @@ async def send_trap():
         return
 
     print("Trap enviado correctamente")
+    print(f"  IP origen : {src_ip}")
+    print(f"  IP destino: {dest_ip}")
 
 
 if __name__ == "__main__":
