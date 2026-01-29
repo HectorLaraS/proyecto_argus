@@ -1,0 +1,85 @@
+# =========================
+# 🐍 Python general
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# =========================
+# 🧠 Entornos virtuales
+# =========================
+venv/
+.venv/
+env/
+ENV/
+*.env
+*.venv
+
+# =========================
+# ⚙️ Configuración / variables
+# =========================
+.env
+.env.*
+!.env.example          # deja solo el ejemplo visible
+
+# =========================
+# 💾 Datos y archivos locales
+# =========================
+data/prod/
+data/**/*.db
+data/**/*.sqlite
+data/**/*.json
+data/**/*.csv
+data/**/*.xlsx
+!data/example.json      # si quieres dejar un archivo de muestra
+
+# =========================
+# 🧪 Pytest / pruebas
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =========================
+# 🧰 Logs, temporales y backups
+# =========================
+*.log
+*.bak
+*.tmp
+*.swp
+
+# =========================
+# 🧭 IDEs y editores
+# =========================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# =========================
+# 📄 Sistema operativo
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# 🗃️ Documentación generada
+# =========================
+docs/_build/
+*.pdf
+*.docx
+*.odt
+
+# =========================
+# 🔒 Claves, certificados
+# =========================
+*.pem
+*.key
+*.crt
