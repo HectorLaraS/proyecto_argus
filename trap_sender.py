@@ -28,7 +28,7 @@ except ImportError:
 
 
 # ================== CONFIG ==================
-DEST_IP = "172.20.10.5"
+DEST_IP = "192.168.100.53"
 DEST_PORT = 1162
 COMMUNITY = "public"
 
