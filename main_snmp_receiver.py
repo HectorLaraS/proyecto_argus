@@ -1,28 +1,16 @@
 """
-ARGUS - SNMP Trap Receiver + Web UI (PySNMP 7.1.22)
-==================================================
+ARGUS - SNMP Trap Receiver + Web UI + Observabilidad (PySNMP 7.1.22)
+===================================================================
 
-✅ FIX real para tu build (según tu debug):
-- El observer SÍ trae transportAddress y securityName
-- PERO NO trae stateReference (no podemos correlacionar por cache)
-=> Solución práctica: guardar "último peer visto" (_LAST_PEER) en el observer
-   y el callback lo consume al instante.
-
-Esto te dará:
-- SRC (ip:puerto) correcto
-- COMMUNITY correcto (alias==community configurado con add_v1_system)
-
-Incluye:
-- Web UI con menú: Live / Exportar / Sistema
-- Exportar TXT + JSON
-- Buffer en memoria (Manager.list) compartido con proceso SNMP
-- Log a archivo traps_received.log
+Observabilidad implementada (orden):
+1) Top N por OID ✅
+2) Rate por IP (últimos N min) ✅ (este commit)
+3) Detección de bursts (siguiente)
+4) Persistencia SQLite (siguiente)
+5) Series/graficación mejorada (siguiente)
 
 Requisitos:
   pip install pysnmp flask
-
-Ejecutar:
-  python main_snmp_receiver.py
 """
 
 from __future__ import annotations
@@ -30,8 +18,10 @@ from __future__ import annotations
 import asyncio
 import multiprocessing as mp
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from collections import Counter, defaultdict
 
 from flask import Flask, jsonify, render_template_string
 
@@ -49,20 +39,27 @@ WEB_PORT = 5000
 
 LOG_FILE = "traps_received.log"
 
-# Imprime UNA vez lo que llega al observer (después se apaga)
-DEBUG_OBSERVER_ONCE = True
+DEBUG_OBSERVER_ONCE = False  # True si quieres ver keys del observer
+
+RATE_WINDOW_MINUTES = 15
 
 traps_buffer: Optional[Any] = None
+WEB_START_EPOCH = time.time()
 
-# Último peer visto (capturado por observer)
-# (src_ip, src_port, community)
 _LAST_PEER: Tuple[str, Optional[int], str] = ("", None, "")
 
 
-# ================== BUFFER UTILS ==================
+# ================== UTILS ==================
 def _buffer_insert_front(buffer: Any, item: Dict[str, Any], max_items: int) -> None:
     buffer.insert(0, item)
     del buffer[max_items:]
+
+
+def _parse_ts(ts: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
 
 
 def format_traps_as_txt(traps: List[Dict[str, Any]]) -> str:
@@ -84,12 +81,86 @@ def format_traps_as_txt(traps: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-# ================== OBSERVER COMPAT ==================
+def compute_stats_from_traps(traps: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = len(traps)
+    last = traps[0] if traps else None
+
+    ip_counter = Counter()
+    comm_counter = Counter()
+    oid_counter = Counter()
+
+    now = datetime.now()
+    window_start = now - timedelta(minutes=RATE_WINDOW_MINUTES)
+    per_min = Counter()
+
+    # ✅ (2) rate por IP en ventana
+    window_ip_counter = Counter()
+    ip_last_seen: Dict[str, str] = {}  # ip -> timestamp string más reciente visto en buffer
+
+    for t in traps:
+        src_ip = t.get("src_ip") or "-"
+        community = t.get("community") or "-"
+        ip_counter[src_ip] += 1
+        comm_counter[community] += 1
+
+        # (1) Top OIDs (varbinds)
+        for vb in t.get("oids", []):
+            oid = vb.get("oid") or "-"
+            oid_counter[oid] += 1
+
+        # último seen por IP (como el buffer está más reciente al inicio, primera vez que lo vemos ya es el más reciente)
+        if src_ip not in ip_last_seen:
+            ip_last_seen[src_ip] = t.get("timestamp", "")
+
+        ts = _parse_ts(t.get("timestamp", ""))
+        if ts:
+            if ts >= window_start:
+                # rate por minuto global
+                per_min[ts.strftime("%H:%M")] += 1
+                # rate por IP (conteo en ventana)
+                window_ip_counter[src_ip] += 1
+
+    # serie por minuto global (rellenar huecos)
+    minute_labels: List[str] = []
+    cur = window_start.replace(second=0, microsecond=0)
+    end = now.replace(second=0, microsecond=0)
+    while cur <= end:
+        minute_labels.append(cur.strftime("%H:%M"))
+        cur += timedelta(minutes=1)
+
+    rate_series = [{"minute": m, "count": int(per_min.get(m, 0))} for m in minute_labels]
+
+    top_ips = [{"src_ip": k, "count": int(v)} for k, v in ip_counter.most_common(10)]
+    top_comms = [{"community": k, "count": int(v)} for k, v in comm_counter.most_common(10)]
+    top_oids = [{"oid": k, "count": int(v)} for k, v in oid_counter.most_common(15)]
+
+    # ✅ Top IPs por rate en ventana
+    top_ip_rates = []
+    for ip, count_in_window in window_ip_counter.most_common(10):
+        top_ip_rates.append(
+            {
+                "src_ip": ip,
+                "window_count": int(count_in_window),
+                "avg_per_min": round(count_in_window / max(RATE_WINDOW_MINUTES, 1), 3),
+                "last_seen": ip_last_seen.get(ip, ""),
+            }
+        )
+
+    return {
+        "total": total,
+        "last_trap": last,
+        "top_ips": top_ips,
+        "top_communities": top_comms,
+        "top_oids": top_oids,
+        "rate_window_minutes": RATE_WINDOW_MINUTES,
+        "rate_per_minute": rate_series,
+        # ✅ NUEVO (2)
+        "top_ip_rates": top_ip_rates,
+    }
+
+
+# ================== OBSERVER ==================
 def _register_observer_compat(snmpEngine, cb, point: str) -> None:
-    """
-    PySNMP 7.x usa snake_case: register_observer
-    Algunas variantes antiguas usan registerObserver
-    """
     obs = snmpEngine.observer
     if hasattr(obs, "register_observer"):
         obs.register_observer(cb, point)
@@ -101,15 +172,7 @@ def _register_observer_compat(snmpEngine, cb, point: str) -> None:
 
 
 def _peer_observer(snmpEngine, execPoint, variables, cbCtx):
-    """
-    Captura SRC/COMMUNITY del mensaje entrante.
-    En tu build (según debug), las keys son:
-      transportAddress -> (ip, port)
-      securityName -> 'public'
-    y NO hay stateReference, por eso usamos _LAST_PEER.
-    """
     global DEBUG_OBSERVER_ONCE, _LAST_PEER
-
     try:
         if DEBUG_OBSERVER_ONCE:
             DEBUG_OBSERVER_ONCE = False
@@ -130,9 +193,7 @@ def _peer_observer(snmpEngine, execPoint, variables, cbCtx):
             community = sec.prettyPrint() if hasattr(sec, "prettyPrint") else str(sec)
 
         _LAST_PEER = (src_ip, src_port, community)
-
     except Exception:
-        # No romper recepción por fallos del observer
         pass
 
 
@@ -141,7 +202,6 @@ def trap_callback(snmpEngine, stateReference, contextEngineId, contextName, varB
     buffer = cbCtx["buffer"]
     max_items = cbCtx["max"]
 
-    # ✅ Tomar el último peer visto por el observer
     global _LAST_PEER
     src_ip, src_port, community = _LAST_PEER
 
@@ -160,7 +220,6 @@ def trap_callback(snmpEngine, stateReference, contextEngineId, contextName, varB
 
     print(f"Trap recibido (buffer={len(buffer)}) SRC={src_ip}:{src_port} COMMUNITY={community}")
 
-    # Log a archivo
     dt = datetime.now()
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as log_trap:
@@ -182,13 +241,9 @@ def start_snmp_server(shared_buffer, listen_ip: str, listen_port: int, max_items
     asyncio.set_event_loop(loop)
 
     snmpEngine = engine.SnmpEngine()
-
-    # Registrar observer (solo una vez)
     _register_observer_compat(snmpEngine, _peer_observer, "rfc3412.receiveMessage:request")
 
-    # Comunidades aceptadas (v1/v2c)
-    # alias == community => securityName sale como community literal
-    config.add_v1_system(snmpEngine, "public-2", "public")
+    config.add_v1_system(snmpEngine, "public", "public")
     config.add_v1_system(snmpEngine, "TACTest", "TACTest")
 
     config.add_transport(
@@ -215,10 +270,10 @@ def start_snmp_server(shared_buffer, listen_ip: str, listen_port: int, max_items
             pass
 
 
-# ================== WEB UI TEMPLATES ==================
+# ================== WEB UI ==================
 HTML_BASE = """
 <!DOCTYPE html>
-<html lang="en">
+<html lang="es">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -226,7 +281,7 @@ HTML_BASE = """
   <style>
     :root { --bg:#0f172a; --panel:#111c33; --border:#334155; --text:#e5e7eb; --muted:#94a3b8; }
     body { margin:0; font-family: Arial, sans-serif; background:var(--bg); color:var(--text) }
-    .nav { position:sticky; top:0; background:rgba(15,23,42,.92); border-bottom:1px solid var(--border); padding:12px; display:flex; gap:14px; align-items:center }
+    .nav { position:sticky; top:0; background:rgba(15,23,42,.92); border-bottom:1px solid var(--border); padding:12px; display:flex; gap:14px; align-items:center; flex-wrap: wrap; }
     .nav a { color:var(--text); text-decoration:none; padding:6px 10px; border-radius:8px; border:1px solid transparent }
     .nav a:hover { border-color:var(--border); background:rgba(51,65,85,.25) }
     .nav a.active { border-color:rgba(56,189,248,.6); background:rgba(56,189,248,.12) }
@@ -238,13 +293,17 @@ HTML_BASE = """
     .oid { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace }
     .meta { color:var(--muted); margin-bottom: 6px; }
     .card { border:1px solid var(--border); background:rgba(17,28,51,.7); padding:12px; border-radius:12px; margin-bottom:12px }
-    .btn { display:inline-block; padding:10px 12px; border-radius:10px; border:1px solid var(--border); text-decoration:none; color:var(--text); background:rgba(51,65,85,.25) }
-    .btn:hover { border-color:rgba(56,189,248,.6); background:rgba(56,189,248,.10) }
+    table { width:100%; border-collapse:collapse; }
+    th, td { text-align:left; padding:8px; border-bottom:1px solid rgba(51,65,85,.5); }
+    th { color: var(--muted); font-weight: 600; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
   <div class="nav">
     <a href="/" class="{{ 'active' if active=='live' else '' }}">Live</a>
+    <a href="/observability" class="{{ 'active' if active=='obs' else '' }}">Observabilidad</a>
     <a href="/export" class="{{ 'active' if active=='export' else '' }}">Exportar</a>
     <a href="/system" class="{{ 'active' if active=='system' else '' }}">Sistema</a>
     <div class="spacer"></div>
@@ -290,6 +349,107 @@ loadTraps();
 </script>
 """
 
+OBS_BODY = """
+<div class="card">
+  <div style="color:#94a3b8">Auto-refresh cada 5s. APIs: <span class="oid">/api/stats</span>, <span class="oid">/api/health</span></div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="oid" style="margin-bottom:8px"><b>Resumen</b></div>
+    <div id="summary" class="oid"></div>
+  </div>
+
+  <div class="card">
+    <div class="oid" style="margin-bottom:8px"><b>Rate global (traps/min) últimos {{ window_min }} min</b></div>
+    <div id="rate" class="oid"></div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="oid" style="margin-bottom:8px"><b>Top IPs origen (total)</b></div>
+    <table>
+      <thead><tr><th>IP</th><th>Count</th></tr></thead>
+      <tbody id="topIps"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="oid" style="margin-bottom:8px"><b>Top Communities (total)</b></div>
+    <table>
+      <thead><tr><th>Community</th><th>Count</th></tr></thead>
+      <tbody id="topComms"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="oid" style="margin-bottom:8px"><b>Top IPs por rate (últimos {{ window_min }} min)</b></div>
+    <table>
+      <thead><tr><th>IP</th><th>Window</th><th>Avg/min</th><th>Last seen</th></tr></thead>
+      <tbody id="topIpRates"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="oid" style="margin-bottom:8px"><b>Top OIDs (VarBinds)</b></div>
+    <table>
+      <thead><tr><th>OID</th><th>Count</th></tr></thead>
+      <tbody id="topOids"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function esc(s){ return (s ?? '').toString().replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+
+async function loadObs() {
+  const [statsR, healthR] = await Promise.all([
+    fetch('/api/stats'),
+    fetch('/api/health')
+  ]);
+  const stats = await statsR.json();
+  const health = await healthR.json();
+
+  const total = stats.total ?? 0;
+  const last = stats.last_trap;
+  const lastLine = last
+    ? `Último: ${esc(last.timestamp)} | SRC ${esc(last.src_ip)}:${esc(last.src_port)} | COMM ${esc(last.community)}`
+    : `Sin traps aún`;
+
+  document.getElementById('summary').innerHTML =
+    `Total traps en buffer: ${total}<br/>` +
+    `${lastLine}<br/>` +
+    `Uptime web: ${esc(health.uptime_seconds)}s`;
+
+  const series = (stats.rate_per_minute ?? []).slice(-20);
+  document.getElementById('rate').innerHTML =
+    series.map(p => `${esc(p.minute)}=${esc(p.count)}`).join(' | ');
+
+  const topIps = stats.top_ips ?? [];
+  document.getElementById('topIps').innerHTML =
+    topIps.map(x => `<tr><td class="oid">${esc(x.src_ip)}</td><td class="oid">${esc(x.count)}</td></tr>`).join('');
+
+  const topComms = stats.top_communities ?? [];
+  document.getElementById('topComms').innerHTML =
+    topComms.map(x => `<tr><td class="oid">${esc(x.community)}</td><td class="oid">${esc(x.count)}</td></tr>`).join('');
+
+  const topIpRates = stats.top_ip_rates ?? [];
+  document.getElementById('topIpRates').innerHTML =
+    topIpRates.map(x => `<tr><td class="oid">${esc(x.src_ip)}</td><td class="oid">${esc(x.window_count)}</td><td class="oid">${esc(x.avg_per_min)}</td><td class="oid">${esc(x.last_seen)}</td></tr>`).join('');
+
+  const topOids = stats.top_oids ?? [];
+  document.getElementById('topOids').innerHTML =
+    topOids.map(x => `<tr><td class="oid">${esc(x.oid)}</td><td class="oid">${esc(x.count)}</td></tr>`).join('');
+}
+
+setInterval(loadObs, 5000);
+loadObs();
+</script>
+"""
+
 EXPORT_BODY = """
 <div class="card">
   <div style="color:#94a3b8; margin-bottom:10px">Descargas del buffer actual.</div>
@@ -310,7 +470,6 @@ SYSTEM_BODY = """
 """
 
 
-# ================== FLASK APP ==================
 def create_app() -> Flask:
     app = Flask(__name__)
 
@@ -331,6 +490,10 @@ def create_app() -> Flask:
     @app.route("/")
     def index():
         return render_page("Live", "Traps (Live)", "live", LIVE_BODY)
+
+    @app.route("/observability")
+    def observability_page():
+        return render_page("Observabilidad", "Observabilidad", "obs", OBS_BODY, window_min=RATE_WINDOW_MINUTES)
 
     @app.route("/export")
     def export_page():
@@ -364,13 +527,30 @@ def create_app() -> Flask:
             "Sistema",
             "Sistema",
             "system",
-            "<div class='card'>Buffer limpiado. "
-            "<a class='btn' href='/system' style='margin-left:10px'>Volver</a></div>",
+            "<div class='card'>Buffer limpiado. <a class='btn' href='/system' style='margin-left:10px'>Volver</a></div>",
         )
 
     @app.route("/api/traps")
     def api_traps():
         return jsonify(list(traps_buffer) if traps_buffer is not None else [])
+
+    @app.route("/api/stats")
+    def api_stats():
+        traps = list(traps_buffer) if traps_buffer is not None else []
+        return jsonify(compute_stats_from_traps(traps))
+
+    @app.route("/api/health")
+    def api_health():
+        traps = list(traps_buffer) if traps_buffer is not None else []
+        last_ts = traps[0].get("timestamp") if traps else None
+        return jsonify(
+            {
+                "status": "ok",
+                "uptime_seconds": int(time.time() - WEB_START_EPOCH),
+                "buffer_size": len(traps),
+                "last_trap_timestamp": last_ts,
+            }
+        )
 
     @app.route("/export/json")
     def export_json():
@@ -390,7 +570,6 @@ def create_app() -> Flask:
     return app
 
 
-# ================== MAIN ==================
 def main() -> None:
     global traps_buffer
     try:
