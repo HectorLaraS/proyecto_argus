@@ -4,10 +4,10 @@ ARGUS - SNMP Trap Receiver + Web UI + Observabilidad (PySNMP 7.1.22)
 
 Observabilidad implementada (orden):
 1) Top N por OID ✅
-2) Rate por IP (últimos N min) ✅ (este commit)
-3) Detección de bursts (siguiente)
-4) Persistencia SQLite (siguiente)
-5) Series/graficación mejorada (siguiente)
+2) Rate por IP (últimos N min) ✅ (Quantity)
+3) Detección de bursts ✅ (este commit)
+4) Persistencia SQLite (pendiente)
+5) Series/graficación mejorada (pendiente)
 
 Requisitos:
   pip install pysnmp flask
@@ -21,7 +21,7 @@ import os
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from collections import Counter, defaultdict
+from collections import Counter
 
 from flask import Flask, jsonify, render_template_string
 
@@ -41,11 +41,18 @@ LOG_FILE = "traps_received.log"
 
 DEBUG_OBSERVER_ONCE = False  # True si quieres ver keys del observer
 
+# Observabilidad
 RATE_WINDOW_MINUTES = 15
+
+# Burst detection (punto 3)
+BURST_WINDOW_SECONDS = 60     # ventana (ej. 60s)
+BURST_THRESHOLD = 20          # si >= 20 traps en 60s => alerta
+BURST_TOP = 10                # mostrar top 10 IPs con más burst
 
 traps_buffer: Optional[Any] = None
 WEB_START_EPOCH = time.time()
 
+# (src_ip, src_port, community) visto por observer
 _LAST_PEER: Tuple[str, Optional[int], str] = ("", None, "")
 
 
@@ -93,13 +100,19 @@ def compute_stats_from_traps(traps: List[Dict[str, Any]]) -> Dict[str, Any]:
     window_start = now - timedelta(minutes=RATE_WINDOW_MINUTES)
     per_min = Counter()
 
-    # ✅ (2) rate por IP en ventana
+    # (2) Rate por IP en ventana (15m)
     window_ip_counter = Counter()
-    ip_last_seen: Dict[str, str] = {}  # ip -> timestamp string más reciente visto en buffer
+    ip_last_seen: Dict[str, str] = {}  # ip -> timestamp más reciente en buffer
+
+    # (3) Burst detection en ventana corta (60s)
+    burst_start = now - timedelta(seconds=BURST_WINDOW_SECONDS)
+    burst_ip_counter = Counter()
+    burst_ip_last_seen: Dict[str, str] = {}  # ip -> último timestamp dentro de burst window
 
     for t in traps:
         src_ip = t.get("src_ip") or "-"
         community = t.get("community") or "-"
+
         ip_counter[src_ip] += 1
         comm_counter[community] += 1
 
@@ -108,17 +121,24 @@ def compute_stats_from_traps(traps: List[Dict[str, Any]]) -> Dict[str, Any]:
             oid = vb.get("oid") or "-"
             oid_counter[oid] += 1
 
-        # último seen por IP (como el buffer está más reciente al inicio, primera vez que lo vemos ya es el más reciente)
+        # last_seen por IP (el buffer es más reciente primero)
         if src_ip not in ip_last_seen:
             ip_last_seen[src_ip] = t.get("timestamp", "")
 
         ts = _parse_ts(t.get("timestamp", ""))
-        if ts:
-            if ts >= window_start:
-                # rate por minuto global
-                per_min[ts.strftime("%H:%M")] += 1
-                # rate por IP (conteo en ventana)
-                window_ip_counter[src_ip] += 1
+        if not ts:
+            continue
+
+        # Rate global + rate por IP en ventana (15m)
+        if ts >= window_start:
+            per_min[ts.strftime("%H:%M")] += 1
+            window_ip_counter[src_ip] += 1
+
+        # (3) Burst counters (60s)
+        if ts >= burst_start:
+            burst_ip_counter[src_ip] += 1
+            if src_ip not in burst_ip_last_seen:
+                burst_ip_last_seen[src_ip] = t.get("timestamp", "")
 
     # serie por minuto global (rellenar huecos)
     minute_labels: List[str] = []
@@ -127,35 +147,61 @@ def compute_stats_from_traps(traps: List[Dict[str, Any]]) -> Dict[str, Any]:
     while cur <= end:
         minute_labels.append(cur.strftime("%H:%M"))
         cur += timedelta(minutes=1)
-
     rate_series = [{"minute": m, "count": int(per_min.get(m, 0))} for m in minute_labels]
 
     top_ips = [{"src_ip": k, "count": int(v)} for k, v in ip_counter.most_common(10)]
     top_comms = [{"community": k, "count": int(v)} for k, v in comm_counter.most_common(10)]
     top_oids = [{"oid": k, "count": int(v)} for k, v in oid_counter.most_common(15)]
 
-    # ✅ Top IPs por rate en ventana
+    # (2) Top IPs por rate en ventana (Quantity)
     top_ip_rates = []
-    for ip, count_in_window in window_ip_counter.most_common(10):
+    for ip, qty in window_ip_counter.most_common(10):
         top_ip_rates.append(
             {
                 "src_ip": ip,
-                "window_count": int(count_in_window),
-                "avg_per_min": round(count_in_window / max(RATE_WINDOW_MINUTES, 1), 3),
+                "quantity": int(qty),
+                "avg_per_min": round(qty / max(RATE_WINDOW_MINUTES, 1), 3),
                 "last_seen": ip_last_seen.get(ip, ""),
             }
         )
 
+    # (3) Burst alerts: IPs que exceden umbral en ventana corta
+    bursts = []
+    for ip, qty in burst_ip_counter.most_common(BURST_TOP):
+        bursts.append(
+            {
+                "src_ip": ip,
+                "quantity": int(qty),
+                "threshold": int(BURST_THRESHOLD),
+                "window_seconds": int(BURST_WINDOW_SECONDS),
+                "is_alert": bool(qty >= BURST_THRESHOLD),
+                "last_seen": burst_ip_last_seen.get(ip, ""),
+            }
+        )
+
+    # Solo las que están en alerta (para UI y/o automatizar más adelante)
+    burst_alerts = [b for b in bursts if b["is_alert"]]
+
     return {
         "total": total,
         "last_trap": last,
+
         "top_ips": top_ips,
         "top_communities": top_comms,
         "top_oids": top_oids,
+
         "rate_window_minutes": RATE_WINDOW_MINUTES,
         "rate_per_minute": rate_series,
-        # ✅ NUEVO (2)
-        "top_ip_rates": top_ip_rates,
+        "top_ip_rates": top_ip_rates,  # (2) Quantity
+
+        # (3) Bursts
+        "burst": {
+            "window_seconds": int(BURST_WINDOW_SECONDS),
+            "threshold": int(BURST_THRESHOLD),
+            "top": int(BURST_TOP),
+        },
+        "bursts": bursts,               # top IPs en burst window (incluye is_alert)
+        "burst_alerts": burst_alerts,   # solo alertas
     }
 
 
@@ -279,7 +325,7 @@ HTML_BASE = """
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{{ title }}</title>
   <style>
-    :root { --bg:#0f172a; --panel:#111c33; --border:#334155; --text:#e5e7eb; --muted:#94a3b8; }
+    :root { --bg:#0f172a; --panel:#111c33; --border:#334155; --text:#e5e7eb; --muted:#94a3b8; --danger:#fb7185; --warn:#fbbf24; }
     body { margin:0; font-family: Arial, sans-serif; background:var(--bg); color:var(--text) }
     .nav { position:sticky; top:0; background:rgba(15,23,42,.92); border-bottom:1px solid var(--border); padding:12px; display:flex; gap:14px; align-items:center; flex-wrap: wrap; }
     .nav a { color:var(--text); text-decoration:none; padding:6px 10px; border-radius:8px; border:1px solid transparent }
@@ -298,6 +344,8 @@ HTML_BASE = """
     th { color: var(--muted); font-weight: 600; }
     .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.85rem; border:1px solid rgba(148,163,184,.35); color:var(--muted); }
+    .badge.alert { border-color: rgba(251,113,133,.6); color: var(--danger); }
   </style>
 </head>
 <body>
@@ -366,6 +414,35 @@ OBS_BODY = """
   </div>
 </div>
 
+<div class="card">
+  <div class="oid" style="margin-bottom:8px"><b>Burst Alerts</b> <span id="burstBadge" class="badge">-</span></div>
+  <div style="color:#94a3b8; margin-bottom:8px">
+    Regla: >= <span class="oid">{{ burst_threshold }}</span> traps en <span class="oid">{{ burst_window }}</span>s por IP.
+  </div>
+  <table>
+    <thead><tr><th>Status</th><th>IP</th><th>Quantity</th><th>Threshold</th><th>Window(s)</th><th>Last seen</th></tr></thead>
+    <tbody id="burstAlerts"></tbody>
+  </table>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="oid" style="margin-bottom:8px"><b>Top IPs por rate (últimos {{ window_min }} min)</b></div>
+    <table>
+      <thead><tr><th>IP</th><th>Quantity</th><th>Avg/min</th><th>Last seen</th></tr></thead>
+      <tbody id="topIpRates"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="oid" style="margin-bottom:8px"><b>Top OIDs (VarBinds)</b></div>
+    <table>
+      <thead><tr><th>OID</th><th>Count</th></tr></thead>
+      <tbody id="topOids"></tbody>
+    </table>
+  </div>
+</div>
+
 <div class="grid">
   <div class="card">
     <div class="oid" style="margin-bottom:8px"><b>Top IPs origen (total)</b></div>
@@ -384,32 +461,11 @@ OBS_BODY = """
   </div>
 </div>
 
-<div class="grid">
-  <div class="card">
-    <div class="oid" style="margin-bottom:8px"><b>Top IPs por rate (últimos {{ window_min }} min)</b></div>
-    <table>
-      <thead><tr><th>IP</th><th>Window</th><th>Avg/min</th><th>Last seen</th></tr></thead>
-      <tbody id="topIpRates"></tbody>
-    </table>
-  </div>
-
-  <div class="card">
-    <div class="oid" style="margin-bottom:8px"><b>Top OIDs (VarBinds)</b></div>
-    <table>
-      <thead><tr><th>OID</th><th>Count</th></tr></thead>
-      <tbody id="topOids"></tbody>
-    </table>
-  </div>
-</div>
-
 <script>
 function esc(s){ return (s ?? '').toString().replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
 
 async function loadObs() {
-  const [statsR, healthR] = await Promise.all([
-    fetch('/api/stats'),
-    fetch('/api/health')
-  ]);
+  const [statsR, healthR] = await Promise.all([ fetch('/api/stats'), fetch('/api/health') ]);
   const stats = await statsR.json();
   const health = await healthR.json();
 
@@ -428,6 +484,41 @@ async function loadObs() {
   document.getElementById('rate').innerHTML =
     series.map(p => `${esc(p.minute)}=${esc(p.count)}`).join(' | ');
 
+  // Bursts
+  const alerts = stats.burst_alerts ?? [];
+  const badge = document.getElementById('burstBadge');
+  if (alerts.length > 0) {
+    badge.textContent = `ALERT: ${alerts.length}`;
+    badge.className = 'badge alert';
+  } else {
+    badge.textContent = 'OK';
+    badge.className = 'badge';
+  }
+
+  document.getElementById('burstAlerts').innerHTML =
+    (alerts.length ? alerts : (stats.bursts ?? [])).map(x => {
+      const status = x.is_alert ? 'ALERT' : 'OK';
+      return `<tr>
+        <td class="oid">${esc(status)}</td>
+        <td class="oid">${esc(x.src_ip)}</td>
+        <td class="oid">${esc(x.quantity)}</td>
+        <td class="oid">${esc(x.threshold)}</td>
+        <td class="oid">${esc(x.window_seconds)}</td>
+        <td class="oid">${esc(x.last_seen)}</td>
+      </tr>`;
+    }).join('');
+
+  // Top IP rates (15m)
+  const topIpRates = stats.top_ip_rates ?? [];
+  document.getElementById('topIpRates').innerHTML =
+    topIpRates.map(x => `<tr><td class="oid">${esc(x.src_ip)}</td><td class="oid">${esc(x.quantity)}</td><td class="oid">${esc(x.avg_per_min)}</td><td class="oid">${esc(x.last_seen)}</td></tr>`).join('');
+
+  // Top OIDs
+  const topOids = stats.top_oids ?? [];
+  document.getElementById('topOids').innerHTML =
+    topOids.map(x => `<tr><td class="oid">${esc(x.oid)}</td><td class="oid">${esc(x.count)}</td></tr>`).join('');
+
+  // totals
   const topIps = stats.top_ips ?? [];
   document.getElementById('topIps').innerHTML =
     topIps.map(x => `<tr><td class="oid">${esc(x.src_ip)}</td><td class="oid">${esc(x.count)}</td></tr>`).join('');
@@ -435,14 +526,6 @@ async function loadObs() {
   const topComms = stats.top_communities ?? [];
   document.getElementById('topComms').innerHTML =
     topComms.map(x => `<tr><td class="oid">${esc(x.community)}</td><td class="oid">${esc(x.count)}</td></tr>`).join('');
-
-  const topIpRates = stats.top_ip_rates ?? [];
-  document.getElementById('topIpRates').innerHTML =
-    topIpRates.map(x => `<tr><td class="oid">${esc(x.src_ip)}</td><td class="oid">${esc(x.window_count)}</td><td class="oid">${esc(x.avg_per_min)}</td><td class="oid">${esc(x.last_seen)}</td></tr>`).join('');
-
-  const topOids = stats.top_oids ?? [];
-  document.getElementById('topOids').innerHTML =
-    topOids.map(x => `<tr><td class="oid">${esc(x.oid)}</td><td class="oid">${esc(x.count)}</td></tr>`).join('');
 }
 
 setInterval(loadObs, 5000);
@@ -493,7 +576,15 @@ def create_app() -> Flask:
 
     @app.route("/observability")
     def observability_page():
-        return render_page("Observabilidad", "Observabilidad", "obs", OBS_BODY, window_min=RATE_WINDOW_MINUTES)
+        return render_page(
+            "Observabilidad",
+            "Observabilidad",
+            "obs",
+            OBS_BODY,
+            window_min=RATE_WINDOW_MINUTES,
+            burst_window=BURST_WINDOW_SECONDS,
+            burst_threshold=BURST_THRESHOLD,
+        )
 
     @app.route("/export")
     def export_page():
