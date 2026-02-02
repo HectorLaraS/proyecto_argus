@@ -1,17 +1,22 @@
 """
-ARGUS - SNMP Trap Receiver + Web UI + Observabilidad + SQLite (PySNMP 7.1.22)
-============================================================================
+ARGUS - SNMP Trap Receiver + Web UI + Observabilidad + SQLite + Retención Settings
+=================================================================================
 
-Observabilidad implementada (orden):
-1) Top N por OID ✅
-2) Rate por IP (Quantity) ✅
-3) Detección de bursts ✅
-4) Persistencia SQLite ✅ (este commit)
-5) Series/graficación mejorada (pendiente)
+PySNMP: 7.1.22
+Flask: 2.x/3.x
+SQLite: stdlib (sqlite3)
+
+Incluye:
+- Receiver SNMP v2c (1162)
+- Buffer en memoria (Manager.list)
+- Persistencia en SQLite (argus.db)
+- Observabilidad (Top OIDs, Top IP rate Quantity, Burst)
+- Export TXT/JSON
+- Settings en DB: retention_days editable desde /system
+- Retención automática (cleanup) sin threads
 
 Requisitos:
   pip install pysnmp flask
-SQLite: viene en Python (stdlib). sqlite3 CLI solo para debug.
 
 Ejecución:
   python main_snmp_receiver.py
@@ -35,6 +40,7 @@ from pysnmp.entity import engine, config
 from pysnmp.entity.rfc3413 import ntfrcv
 from pysnmp.carrier.asyncio.dgram import udp
 
+
 # ================== CONFIG ==================
 SNMP_LISTEN_IP = "0.0.0.0"
 SNMP_PORT = 1162
@@ -49,7 +55,7 @@ DB_PATH = os.path.join(DATA_DIR, "argus.db")
 
 LOG_FILE = "traps_received.log"
 
-DEBUG_OBSERVER_ONCE = False  # True si quieres ver keys del observer (una vez)
+DEBUG_OBSERVER_ONCE = False  # True => imprime keys del observer una vez
 
 # Observabilidad
 RATE_WINDOW_MINUTES = 15
@@ -61,6 +67,9 @@ BURST_TOP = 10
 
 # DB query defaults
 DB_TRAPS_LIMIT_DEFAULT = 200
+
+# Retención (ejecución del cleanup, el "cuánto" está en settings.retention_days)
+RETENTION_CLEANUP_EVERY_SECONDS = 1800  # 30 min
 
 traps_buffer: Optional[Any] = None
 WEB_START_EPOCH = time.time()
@@ -117,6 +126,7 @@ def format_traps_as_txt(traps: List[Dict[str, Any]]) -> str:
 def db_connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    # WAL requiere permiso de escritura en directorio (db-wal/db-shm)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
@@ -154,18 +164,74 @@ def db_init(db_path: str) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_traps_ts_epoch ON traps(ts_epoch);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_traps_src_ip ON traps(src_ip);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_varbinds_oid ON varbinds(oid);")
+
+        # Settings (si ya la creaste, esto no afecta)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            """
+        )
+
+        # Default: retention_days=7 si no existe
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO settings(key, value, updated_at)
+            VALUES ('retention_days', '7', strftime('%s','now'));
+            """
+        )
+
         conn.commit()
     finally:
         conn.close()
 
 
+def db_setting_get_int(conn: sqlite3.Connection, key: str, default: int) -> int:
+    row = conn.execute("SELECT value FROM settings WHERE key=?;", (key,)).fetchone()
+    if not row:
+        return default
+    try:
+        return int(row["value"])
+    except Exception:
+        return default
+
+
+def db_setting_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    now = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO settings(key, value, updated_at)
+        VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
+        """,
+        (key, str(value), now),
+    )
+    conn.commit()
+
+
+def db_apply_retention(conn: sqlite3.Connection) -> None:
+    """
+    Retención por días (configurable por settings.retention_days).
+    retention_days:
+      - >0 => borrar traps con ts_epoch < now - days
+      - 0  => deshabilitado
+    """
+    retention_days = db_setting_get_int(conn, "retention_days", 7)
+    if retention_days <= 0:
+        return
+
+    cutoff = int(time.time()) - (retention_days * 86400)
+    conn.execute("DELETE FROM traps WHERE ts_epoch < ?;", (int(cutoff),))
+    conn.commit()
+
+
 def db_insert_trap(conn: sqlite3.Connection, trap: Dict[str, Any]) -> None:
-    """
-    Inserta trap + varbinds en una transacción.
-    """
     raw = json.dumps(trap, ensure_ascii=False)
-    ts_epoch = trap.get("ts_epoch")
-    ts_text = trap.get("timestamp")
+    ts_epoch = int(trap.get("ts_epoch") or _epoch_now())
+    ts_text = str(trap.get("timestamp") or _fmt_ts_from_epoch(ts_epoch))
 
     cur = conn.execute(
         """
@@ -173,8 +239,8 @@ def db_insert_trap(conn: sqlite3.Connection, trap: Dict[str, Any]) -> None:
         VALUES(?,?,?,?,?,?);
         """,
         (
-            int(ts_epoch) if ts_epoch is not None else _epoch_now(),
-            str(ts_text) if ts_text else _fmt_ts_from_epoch(_epoch_now()),
+            ts_epoch,
+            ts_text,
             trap.get("src_ip") or None,
             trap.get("src_port"),
             trap.get("community") or None,
@@ -210,21 +276,15 @@ def db_fetch_traps(db_path: str, limit: int = DB_TRAPS_LIMIT_DEFAULT) -> List[Di
 
 
 def db_stats(db_path: str) -> Dict[str, Any]:
-    """
-    Stats calculadas desde DB, usando ventanas de tiempo reales:
-    - rate window (N min)
-    - burst window (N sec)
-    """
     now_epoch = _epoch_now()
     rate_start = now_epoch - (RATE_WINDOW_MINUTES * 60)
     burst_start = now_epoch - BURST_WINDOW_SECONDS
 
     conn = db_connect(db_path)
     try:
-        # last trap
         last_row = conn.execute(
             """
-            SELECT ts_text, src_ip, src_port, community, raw_json
+            SELECT raw_json
             FROM traps
             ORDER BY ts_epoch DESC
             LIMIT 1;
@@ -236,19 +296,12 @@ def db_stats(db_path: str) -> Dict[str, Any]:
             try:
                 last_trap = json.loads(last_row["raw_json"])
             except Exception:
-                last_trap = {
-                    "timestamp": last_row["ts_text"],
-                    "src_ip": last_row["src_ip"],
-                    "src_port": last_row["src_port"],
-                    "community": last_row["community"],
-                    "oids": [],
-                }
+                last_trap = None
 
         total = conn.execute("SELECT COUNT(*) AS c FROM traps;").fetchone()["c"]
 
-        # Top IPs total
         top_ips = [
-            {"src_ip": r["src_ip"] or "-", "count": int(r["c"])}
+            {"src_ip": (r["src_ip"] or "-"), "count": int(r["c"])}
             for r in conn.execute(
                 """
                 SELECT src_ip, COUNT(*) AS c
@@ -260,9 +313,8 @@ def db_stats(db_path: str) -> Dict[str, Any]:
             ).fetchall()
         ]
 
-        # Top communities total
         top_comms = [
-            {"community": r["community"] or "-", "count": int(r["c"])}
+            {"community": (r["community"] or "-"), "count": int(r["c"])}
             for r in conn.execute(
                 """
                 SELECT community, COUNT(*) AS c
@@ -274,9 +326,8 @@ def db_stats(db_path: str) -> Dict[str, Any]:
             ).fetchall()
         ]
 
-        # Top OIDs total (varbinds)
         top_oids = [
-            {"oid": r["oid"] or "-", "count": int(r["c"])}
+            {"oid": (r["oid"] or "-"), "count": int(r["c"])}
             for r in conn.execute(
                 """
                 SELECT oid, COUNT(*) AS c
@@ -288,7 +339,6 @@ def db_stats(db_path: str) -> Dict[str, Any]:
             ).fetchall()
         ]
 
-        # Rate per minute (last N minutes)
         rate_rows = conn.execute(
             """
             SELECT strftime('%H:%M', datetime(ts_epoch, 'unixepoch', 'localtime')) AS minute,
@@ -302,7 +352,6 @@ def db_stats(db_path: str) -> Dict[str, Any]:
         ).fetchall()
         rate_map = {r["minute"]: int(r["c"]) for r in rate_rows}
 
-        # Fill minutes for stable series
         now_dt = datetime.now()
         window_start_dt = now_dt - timedelta(minutes=RATE_WINDOW_MINUTES)
         minute_labels: List[str] = []
@@ -313,7 +362,6 @@ def db_stats(db_path: str) -> Dict[str, Any]:
             cur += timedelta(minutes=1)
         rate_series = [{"minute": m, "count": int(rate_map.get(m, 0))} for m in minute_labels]
 
-        # Top IP rates in last N minutes (Quantity)
         ip_rate_rows = conn.execute(
             """
             SELECT src_ip,
@@ -342,7 +390,6 @@ def db_stats(db_path: str) -> Dict[str, Any]:
                 }
             )
 
-        # Burst detection (last BURST_WINDOW_SECONDS)
         burst_rows = conn.execute(
             """
             SELECT src_ip,
@@ -375,6 +422,8 @@ def db_stats(db_path: str) -> Dict[str, Any]:
 
         burst_alerts = [b for b in bursts if b["is_alert"]]
 
+        retention_days = db_setting_get_int(conn, "retention_days", 7)
+
         return {
             "source": "db",
             "total": int(total),
@@ -392,16 +441,14 @@ def db_stats(db_path: str) -> Dict[str, Any]:
             },
             "bursts": bursts,
             "burst_alerts": burst_alerts,
+            "settings": {"retention_days": int(retention_days)},
         }
     finally:
         conn.close()
 
 
-# ================== MEM STATS (existing) ==================
+# ================== MEM STATS ==================
 def compute_stats_from_traps(traps: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Stats desde memoria (buffer).
-    """
     total = len(traps)
     last = traps[0] if traps else None
 
@@ -502,6 +549,7 @@ def compute_stats_from_traps(traps: List[Dict[str, Any]]) -> Dict[str, Any]:
         },
         "bursts": bursts,
         "burst_alerts": burst_alerts,
+        "settings": {"retention_days": None},
     }
 
 
@@ -568,17 +616,26 @@ def trap_callback(snmpEngine, stateReference, contextEngineId, contextName, varB
     # Buffer (mem)
     _buffer_insert_front(buffer, trap, max_items)
 
-    # DB persist (punto 4)
+    # DB persist
     try:
         db_insert_trap(db_conn, trap)
         db_conn.commit()
     except Exception as e:
-        # no queremos tirar el receiver por un error de DB
         try:
             db_conn.rollback()
         except Exception:
             pass
         print(f"[DB ERROR] {e}")
+
+    # Retención (throttled)
+    now = int(time.time())
+    last_cleanup = int(cbCtx.get("last_cleanup", 0) or 0)
+    if now - last_cleanup >= RETENTION_CLEANUP_EVERY_SECONDS:
+        try:
+            db_apply_retention(db_conn)
+            cbCtx["last_cleanup"] = now
+        except Exception as e:
+            print(f"[RETENTION ERROR] {e}")
 
     # Log file
     dt = datetime.now()
@@ -603,14 +660,18 @@ def start_snmp_server(shared_buffer, listen_ip: str, listen_port: int, max_items
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    # Init DB in SNMP process (safe)
     db_init(db_path)
     db_conn = db_connect(db_path)
+
+    # Aplica retención al arranque (por si cambió y no han llegado traps aún)
+    try:
+        db_apply_retention(db_conn)
+    except Exception as e:
+        print(f"[RETENTION ERROR] startup: {e}")
 
     snmpEngine = engine.SnmpEngine()
     _register_observer_compat(snmpEngine, _peer_observer, "rfc3412.receiveMessage:request")
 
-    # Comunidades aceptadas
     config.add_v1_system(snmpEngine, "public", "public")
     config.add_v1_system(snmpEngine, "TACTest", "TACTest")
 
@@ -623,7 +684,7 @@ def start_snmp_server(shared_buffer, listen_ip: str, listen_port: int, max_items
     ntfrcv.NotificationReceiver(
         snmpEngine,
         trap_callback,
-        cbCtx={"buffer": shared_buffer, "max": max_items, "db_conn": db_conn},
+        cbCtx={"buffer": shared_buffer, "max": max_items, "db_conn": db_conn, "last_cleanup": 0},
     )
 
     print(f"SNMP Trap Receiver escuchando en {listen_ip}:{listen_port}")
@@ -676,6 +737,7 @@ HTML_BASE = """
     .small { color: var(--muted); font-size:.9rem; }
     .btn { display:inline-block; padding:8px 10px; border-radius:10px; border:1px solid var(--border); text-decoration:none; color:var(--text); background:rgba(51,65,85,.25) }
     .btn:hover { border-color:rgba(56,189,248,.6); background:rgba(56,189,248,.10) }
+    input { padding:8px; border-radius:10px; border:1px solid var(--border); background:#0f172a; color:var(--text) }
   </style>
 </head>
 <body>
@@ -825,6 +887,10 @@ async function loadObs() {
 
   const total = stats.total ?? 0;
   const last = stats.last_trap;
+  const retention = (stats.settings && stats.settings.retention_days !== null && stats.settings.retention_days !== undefined)
+    ? stats.settings.retention_days
+    : '-';
+
   const lastLine = last
     ? `Último: ${esc(last.timestamp)} | SRC ${esc(last.src_ip)}:${esc(last.src_port)} | COMM ${esc(last.community)}`
     : `Sin traps aún`;
@@ -833,13 +899,13 @@ async function loadObs() {
     `Source: ${esc(stats.source)}<br/>` +
     `Total traps: ${total}<br/>` +
     `${lastLine}<br/>` +
+    `Retention (days): ${esc(retention)}<br/>` +
     `Uptime web: ${esc(health.uptime_seconds)}s`;
 
   const series = (stats.rate_per_minute ?? []).slice(-20);
   document.getElementById('rate').innerHTML =
     series.map(p => `${esc(p.minute)}=${esc(p.count)}`).join(' | ');
 
-  // Bursts
   const alerts = stats.burst_alerts ?? [];
   const badge = document.getElementById('burstBadge');
   if (alerts.length > 0) {
@@ -863,17 +929,14 @@ async function loadObs() {
       </tr>`;
     }).join('');
 
-  // Top IP rates
   const topIpRates = stats.top_ip_rates ?? [];
   document.getElementById('topIpRates').innerHTML =
     topIpRates.map(x => `<tr><td class="oid">${esc(x.src_ip)}</td><td class="oid">${esc(x.quantity)}</td><td class="oid">${esc(x.avg_per_min)}</td><td class="oid">${esc(x.last_seen)}</td></tr>`).join('');
 
-  // Top OIDs
   const topOids = stats.top_oids ?? [];
   document.getElementById('topOids').innerHTML =
     topOids.map(x => `<tr><td class="oid">${esc(x.oid)}</td><td class="oid">${esc(x.count)}</td></tr>`).join('');
 
-  // totals
   const topIps = stats.top_ips ?? [];
   document.getElementById('topIps').innerHTML =
     topIps.map(x => `<tr><td class="oid">${esc(x.src_ip)}</td><td class="oid">${esc(x.count)}</td></tr>`).join('');
@@ -908,9 +971,21 @@ SYSTEM_BODY = """
   <div class="oid">Web: {{ web_host }}:{{ web_port }}</div>
   <div class="oid">Log: {{ log_path }}</div>
   <div class="oid">DB:  {{ db_path }}</div>
-  <div style="margin-top:10px">
-    <a class="btn" href="/system/clear">Limpiar buffer (mem)</a>
-  </div>
+</div>
+
+<div class="card">
+  <div class="oid"><b>Retention</b></div>
+  <div class="small">Días que se conservarán traps en SQLite (0 = deshabilitado). Default recomendado: 7.</div>
+
+  <form action="/api/settings/retention" method="post" style="margin-top:10px">
+    <label class="small" for="retention_days">retention_days:</label><br/>
+    <input id="retention_days" name="retention_days" value="{{ retention_days }}" />
+    <button class="btn" type="submit" style="margin-left:8px">Guardar</button>
+  </form>
+</div>
+
+<div class="card">
+  <a class="btn" href="/system/clear">Limpiar buffer (mem)</a>
 </div>
 """
 
@@ -955,6 +1030,12 @@ def create_app() -> Flask:
 
     @app.route("/system")
     def system_page():
+        conn = db_connect(DB_PATH)
+        try:
+            retention_days = db_setting_get_int(conn, "retention_days", 7)
+        finally:
+            conn.close()
+
         return render_page(
             "Sistema",
             "Sistema",
@@ -966,6 +1047,7 @@ def create_app() -> Flask:
             web_port=WEB_PORT,
             log_path=os.path.abspath(LOG_FILE),
             db_path=DB_PATH,
+            retention_days=retention_days,
         )
 
     @app.route("/system/clear")
@@ -984,6 +1066,41 @@ def create_app() -> Flask:
             "system",
             "<div class='card'>Buffer (mem) limpiado. <a class='btn' href='/system' style='margin-left:10px'>Volver</a></div>",
         )
+
+    @app.route("/api/settings")
+    def api_settings():
+        conn = db_connect(DB_PATH)
+        try:
+            days = db_setting_get_int(conn, "retention_days", 7)
+            return jsonify({"retention_days": days})
+        finally:
+            conn.close()
+
+    @app.route("/api/settings/retention", methods=["POST"])
+    def api_set_retention():
+        days = (request.form.get("retention_days") or "").strip()
+
+        # permitir enteros (incluye 0)
+        try:
+            days_int = int(days)
+        except Exception:
+            return jsonify({"ok": False, "error": "retention_days debe ser entero"}), 400
+
+        # sanity (evita valores absurdos por accidente)
+        if days_int < 0 or days_int > 3650:
+            return jsonify({"ok": False, "error": "retention_days fuera de rango (0..3650)"}), 400
+
+        conn = db_connect(DB_PATH)
+        try:
+            db_setting_set(conn, "retention_days", str(days_int))
+            # opcional: aplicar retención al instante (desde web)
+            try:
+                db_apply_retention(conn)
+            except Exception:
+                pass
+            return jsonify({"ok": True, "retention_days": days_int})
+        finally:
+            conn.close()
 
     @app.route("/api/traps")
     def api_traps():
@@ -1047,7 +1164,6 @@ def create_app() -> Flask:
 def main() -> None:
     global traps_buffer
 
-    # Ensure data dir exists (useful even if DB init happens in SNMP process)
     _ensure_dir(DATA_DIR)
 
     try:

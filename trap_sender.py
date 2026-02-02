@@ -30,7 +30,7 @@ except ImportError:
 # ================== CONFIG ==================
 DEST_IP = "192.168.100.53"
 DEST_PORT = 1162
-COMMUNITY = "TACTest"
+COMMUNITY = "public"
 
 # Trap estándar
 TRAP_OID = "1.3.6.1.6.3.1.1.5.3"  # linkDown
