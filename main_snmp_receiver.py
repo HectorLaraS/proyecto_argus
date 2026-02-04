@@ -1,19 +1,20 @@
 """
-ARGUS - SNMP Trap Receiver + Web UI + Observabilidad + SQLite + Retención Settings
-=================================================================================
+ARGUS - SNMP Trap Receiver + Web UI + Observabilidad + SQLite + Retención Settings + Series API
+==============================================================================================
 
 PySNMP: 7.1.22
 Flask: 2.x/3.x
-SQLite: stdlib (sqlite3)
+SQLite: stdlib
 
 Incluye:
 - Receiver SNMP v2c (1162)
 - Buffer en memoria (Manager.list)
-- Persistencia en SQLite (argus.db)
-- Observabilidad (Top OIDs, Top IP rate Quantity, Burst)
+- Persistencia SQLite (traps/varbinds)
+- Observabilidad (Top OIDs, Top IPs por rate Quantity, Burst)
 - Export TXT/JSON
-- Settings en DB: retention_days editable desde /system
+- Settings: retention_days (default 7) editable desde /system (presets + custom)
 - Retención automática (cleanup) sin threads
+- API series histórica: /api/series?span=15m|1h|24h|7d|30d
 
 Requisitos:
   pip install pysnmp flask
@@ -68,8 +69,9 @@ BURST_TOP = 10
 # DB query defaults
 DB_TRAPS_LIMIT_DEFAULT = 200
 
-# Retención (ejecución del cleanup, el "cuánto" está en settings.retention_days)
+# Retención (cuánto se conserva está en settings.retention_days)
 RETENTION_CLEANUP_EVERY_SECONDS = 1800  # 30 min
+
 
 traps_buffer: Optional[Any] = None
 WEB_START_EPOCH = time.time()
@@ -283,12 +285,7 @@ def db_stats(db_path: str) -> Dict[str, Any]:
     conn = db_connect(db_path)
     try:
         last_row = conn.execute(
-            """
-            SELECT raw_json
-            FROM traps
-            ORDER BY ts_epoch DESC
-            LIMIT 1;
-            """
+            "SELECT raw_json FROM traps ORDER BY ts_epoch DESC LIMIT 1;"
         ).fetchone()
 
         last_trap = None
@@ -442,6 +439,127 @@ def db_stats(db_path: str) -> Dict[str, Any]:
             "bursts": bursts,
             "burst_alerts": burst_alerts,
             "settings": {"retention_days": int(retention_days)},
+        }
+    finally:
+        conn.close()
+
+
+def db_series(db_path: str, span: str = "15m") -> Dict[str, Any]:
+    """
+    Devuelve serie de traps agregada por tiempo, usando SQLite.
+    span:
+      - 15m, 1h  => bucket por minuto
+      - 24h      => bucket por 5 minutos
+      - 7d       => bucket por hora
+      - 30d      => bucket por día
+    """
+    now = int(time.time())
+
+    if span == "15m":
+        start = now - 15 * 60
+        bucket = "minute"
+        step_seconds = 60
+    elif span == "1h":
+        start = now - 60 * 60
+        bucket = "minute"
+        step_seconds = 60
+    elif span == "24h":
+        start = now - 24 * 60 * 60
+        bucket = "5min"
+        step_seconds = 5 * 60
+    elif span == "7d":
+        start = now - 7 * 24 * 60 * 60
+        bucket = "hour"
+        step_seconds = 60 * 60
+    elif span == "30d":
+        start = now - 30 * 24 * 60 * 60
+        bucket = "day"
+        step_seconds = 24 * 60 * 60
+    else:
+        start = now - 15 * 60
+        bucket = "minute"
+        step_seconds = 60
+
+    conn = db_connect(db_path)
+    try:
+        if bucket == "minute":
+            sql = """
+            SELECT strftime('%Y-%m-%d %H:%M', datetime(ts_epoch, 'unixepoch', 'localtime')) AS t,
+                   COUNT(*) AS c
+            FROM traps
+            WHERE ts_epoch >= ?
+            GROUP BY t
+            ORDER BY t ASC;
+            """
+        elif bucket == "5min":
+            sql = """
+            SELECT ((ts_epoch / 300) * 300) AS t_epoch,
+                   COUNT(*) AS c
+            FROM traps
+            WHERE ts_epoch >= ?
+            GROUP BY t_epoch
+            ORDER BY t_epoch ASC;
+            """
+        elif bucket == "hour":
+            sql = """
+            SELECT strftime('%Y-%m-%d %H:00', datetime(ts_epoch, 'unixepoch', 'localtime')) AS t,
+                   COUNT(*) AS c
+            FROM traps
+            WHERE ts_epoch >= ?
+            GROUP BY t
+            ORDER BY t ASC;
+            """
+        else:  # day
+            sql = """
+            SELECT strftime('%Y-%m-%d', datetime(ts_epoch, 'unixepoch', 'localtime')) AS t,
+                   COUNT(*) AS c
+            FROM traps
+            WHERE ts_epoch >= ?
+            GROUP BY t
+            ORDER BY t ASC;
+            """
+
+        rows = conn.execute(sql, (int(start),)).fetchall()
+
+        points: List[Dict[str, Any]] = []
+        if bucket == "5min":
+            m = {int(r["t_epoch"]): int(r["c"]) for r in rows}
+            cur = (start // step_seconds) * step_seconds
+            end = (now // step_seconds) * step_seconds
+            while cur <= end:
+                points.append({"t": _fmt_ts_from_epoch(cur), "count": int(m.get(cur, 0))})
+                cur += step_seconds
+        else:
+            m = {str(r["t"]): int(r["c"]) for r in rows}
+            cur_dt = datetime.fromtimestamp(start).replace(second=0, microsecond=0)
+            end_dt = datetime.fromtimestamp(now).replace(second=0, microsecond=0)
+
+            if bucket == "hour":
+                cur_dt = cur_dt.replace(minute=0)
+                end_dt = end_dt.replace(minute=0)
+                step = timedelta(hours=1)
+                fmt = "%Y-%m-%d %H:00"
+            elif bucket == "day":
+                cur_dt = cur_dt.replace(hour=0, minute=0)
+                end_dt = end_dt.replace(hour=0, minute=0)
+                step = timedelta(days=1)
+                fmt = "%Y-%m-%d"
+            else:  # minute
+                step = timedelta(minutes=1)
+                fmt = "%Y-%m-%d %H:%M"
+
+            while cur_dt <= end_dt:
+                key = cur_dt.strftime(fmt)
+                points.append({"t": key, "count": int(m.get(key, 0))})
+                cur_dt += step
+
+        return {
+            "source": "db",
+            "span": span,
+            "bucket": bucket,
+            "start_epoch": int(start),
+            "end_epoch": int(now),
+            "points": points,
         }
     finally:
         conn.close()
@@ -663,7 +781,7 @@ def start_snmp_server(shared_buffer, listen_ip: str, listen_port: int, max_items
     db_init(db_path)
     db_conn = db_connect(db_path)
 
-    # Aplica retención al arranque (por si cambió y no han llegado traps aún)
+    # Aplica retención al arranque
     try:
         db_apply_retention(db_conn)
     except Exception as e:
@@ -672,6 +790,7 @@ def start_snmp_server(shared_buffer, listen_ip: str, listen_port: int, max_items
     snmpEngine = engine.SnmpEngine()
     _register_observer_compat(snmpEngine, _peer_observer, "rfc3412.receiveMessage:request")
 
+    # Comunidades permitidas (v1/v2c)
     config.add_v1_system(snmpEngine, "public", "public")
     config.add_v1_system(snmpEngine, "TACTest", "TACTest")
 
@@ -738,6 +857,7 @@ HTML_BASE = """
     .btn { display:inline-block; padding:8px 10px; border-radius:10px; border:1px solid var(--border); text-decoration:none; color:var(--text); background:rgba(51,65,85,.25) }
     .btn:hover { border-color:rgba(56,189,248,.6); background:rgba(56,189,248,.10) }
     input { padding:8px; border-radius:10px; border:1px solid var(--border); background:#0f172a; color:var(--text) }
+    button { cursor:pointer; }
   </style>
 </head>
 <body>
@@ -975,13 +1095,39 @@ SYSTEM_BODY = """
 
 <div class="card">
   <div class="oid"><b>Retention</b></div>
-  <div class="small">Días que se conservarán traps en SQLite (0 = deshabilitado). Default recomendado: 7.</div>
+  <div class="small">
+    Días que se conservarán traps en SQLite.
+    <span class="oid">0</span> = deshabilitado.
+    Default recomendado: <span class="oid">7</span>.
+  </div>
 
-  <form action="/api/settings/retention" method="post" style="margin-top:10px">
-    <label class="small" for="retention_days">retention_days:</label><br/>
-    <input id="retention_days" name="retention_days" value="{{ retention_days }}" />
-    <button class="btn" type="submit" style="margin-left:8px">Guardar</button>
-  </form>
+  <div class="small" style="margin-top:10px">
+    Actual: <span class="oid"><b>{{ retention_days }}</b></span> días
+  </div>
+
+  <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap">
+    {% for d in [0,1,7,14,30,90] %}
+      <form action="/api/settings/retention" method="post" style="margin:0">
+        <input type="hidden" name="retention_days" value="{{ d }}">
+        <button class="btn" type="submit">
+          {% if d == 0 %}Deshabilitar (0){% else %}{{ d }} días{% endif %}
+        </button>
+      </form>
+    {% endfor %}
+  </div>
+
+  <div style="margin-top:14px">
+    <div class="small">Custom (0..3650):</div>
+    <form action="/api/settings/retention" method="post"
+          style="margin-top:8px; display:flex; gap:10px; flex-wrap:wrap; align-items:center">
+      <input name="retention_days" value="{{ retention_days }}" />
+      <button class="btn" type="submit">Guardar</button>
+    </form>
+  </div>
+
+  <div class="small" style="margin-top:12px">
+    Nota: al guardar, ARGUS aplica retención inmediatamente en la DB.
+  </div>
 </div>
 
 <div class="card">
@@ -1080,20 +1226,18 @@ def create_app() -> Flask:
     def api_set_retention():
         days = (request.form.get("retention_days") or "").strip()
 
-        # permitir enteros (incluye 0)
         try:
             days_int = int(days)
         except Exception:
             return jsonify({"ok": False, "error": "retention_days debe ser entero"}), 400
 
-        # sanity (evita valores absurdos por accidente)
         if days_int < 0 or days_int > 3650:
             return jsonify({"ok": False, "error": "retention_days fuera de rango (0..3650)"}), 400
 
         conn = db_connect(DB_PATH)
         try:
             db_setting_set(conn, "retention_days", str(days_int))
-            # opcional: aplicar retención al instante (desde web)
+            # aplicar retención al instante
             try:
                 db_apply_retention(conn)
             except Exception:
@@ -1118,6 +1262,11 @@ def create_app() -> Flask:
             traps = list(traps_buffer) if traps_buffer is not None else []
             return jsonify(compute_stats_from_traps(traps))
         return jsonify(db_stats(DB_PATH))
+
+    @app.route("/api/series")
+    def api_series():
+        span = (request.args.get("span") or "15m").lower()
+        return jsonify(db_series(DB_PATH, span=span))
 
     @app.route("/api/health")
     def api_health():
