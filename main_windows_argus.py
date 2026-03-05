@@ -43,14 +43,14 @@ from pysnmp.carrier.asyncio.dgram import udp
 
 # ================== CONFIG (WINDOWS) ==================
 SNMP_LISTEN_IP = "0.0.0.0"
-SNMP_PORT = 1162
+SNMP_PORT = 162
 MAX_TRAPS = 200
 
 WEB_HOST = "0.0.0.0"
-WEB_PORT = 5000
+WEB_PORT = 5010
 
 # Directorio fijo para Windows (tu ruta)
-PROJECT_ROOT = r"D:\TAC - Python\snmp_server"
+PROJECT_ROOT = r"E:\TAC Python\trap_viewer"
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
 # Log dentro de data para evitar problemas con cwd
@@ -314,6 +314,10 @@ def start_snmp_server(shared_buffer, listen_ip: str, listen_port: int, max_items
     # Comunidades permitidas (v1/v2c)
     config.add_v1_system(snmpEngine, "public", "public")
     config.add_v1_system(snmpEngine, "TACTest", "TACTest")
+    config.add_v1_system(snmpEngine, 'WIU', 'ALSTOM SNMP')
+    config.add_v1_system(snmpEngine, 'WIU-2', 'ALSTOM SNMP Trap')
+    config.add_v1_system(snmpEngine, 'DAU', 'helloworld')
+    ##config.add_v1_system(snmpEngine, 'router', 'public')
 
     config.add_transport(
         snmpEngine,

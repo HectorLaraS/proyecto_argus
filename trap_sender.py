@@ -28,8 +28,8 @@ except ImportError:
 
 
 # ================== CONFIG ==================
-DEST_IP = "192.168.100.53"
-DEST_PORT = 1162
+DEST_IP = "10.190.68.22"
+DEST_PORT = 162
 COMMUNITY = "public"
 
 # Trap estándar
