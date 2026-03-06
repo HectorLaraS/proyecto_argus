@@ -9,9 +9,11 @@ SNMP Trap Receiver + Web UI + Observabilidad + Export (TXT/JSON)
 - Log a archivo local
 - Observabilidad (Top OIDs, Top IPs, rate por minuto, burst alerts)
 - Export TXT/JSON desde memoria
+- Hook de integraciones
+- UI base de Integraciones
 
 Requisitos:
-  pip install pysnmp flask
+  pip install pysnmp flask python-dotenv
 
 Ejecución (Windows):
   python windows_main_argus.py
@@ -26,7 +28,6 @@ Notas:
 from __future__ import annotations
 
 import asyncio
-import json
 import multiprocessing as mp
 import os
 import time
@@ -39,6 +40,18 @@ from flask import Flask, jsonify, render_template_string, request
 from pysnmp.entity import engine, config
 from pysnmp.entity.rfc3413 import ntfrcv
 from pysnmp.carrier.asyncio.dgram import udp
+from dotenv import load_dotenv
+
+from integrations.dispatcher import dispatch_integrations
+from integrations.dpa.memory_store import (
+    clear_all,
+    configure_store,
+    get_active_issues,
+    get_recent_events,
+    get_summary,
+)
+
+load_dotenv()
 
 
 # ================== CONFIG (WINDOWS) ==================
@@ -50,7 +63,7 @@ WEB_HOST = "0.0.0.0"
 WEB_PORT = 5010
 
 # Directorio fijo para Windows (tu ruta)
-PROJECT_ROOT = r"E:\TAC Python\trap_viewer"
+PROJECT_ROOT = os.getenv("PROJECT_ROOT_PATH") or os.getcwd()
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
 # Log dentro de data para evitar problemas con cwd
@@ -261,6 +274,36 @@ def _peer_observer(snmpEngine, execPoint, variables, cbCtx):
         pass
 
 
+def process_trap_general(buffer: Any, trap: Dict[str, Any], max_items: int) -> None:
+    """
+    Flujo principal actual de ARGUS:
+    - guardar en buffer
+    - escribir log
+    - imprimir en consola
+    """
+    _buffer_insert_front(buffer, trap, max_items)
+
+    dt = datetime.now()
+    src_ip = trap.get("src_ip", "")
+    src_port = trap.get("src_port", None)
+    community = trap.get("community", "")
+
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as log_trap:
+            log_trap.write("\nTrap Received:")
+            log_trap.write(f"\n  Datetime: {dt}")
+            log_trap.write(f"\n  SRC: {src_ip}:{src_port}")
+            log_trap.write(f"\n  COMMUNITY: {community}")
+            for vb in trap["oids"]:
+                log_trap.write(f"\n  {vb['oid']} = {vb['value']}")
+            log_trap.write("\n")
+            log_trap.flush()
+    except Exception as e:
+        print(f"[LOG ERROR] {e} (cwd={os.getcwd()}, abs={os.path.abspath(LOG_FILE)})")
+
+    print(f"Trap recibido (buffer={len(buffer)}) SRC={src_ip}:{src_port} COMMUNITY={community}")
+
+
 # ================== SNMP CALLBACK ==================
 def trap_callback(snmpEngine, stateReference, contextEngineId, contextName, varBinds, cbCtx):
     buffer = cbCtx["buffer"]
@@ -282,31 +325,26 @@ def trap_callback(snmpEngine, stateReference, contextEngineId, contextName, varB
     for name, val in varBinds:
         trap["oids"].append({"oid": name.prettyPrint(), "value": val.prettyPrint()})
 
-    # Buffer (mem)
-    _buffer_insert_front(buffer, trap, max_items)
+    process_trap_general(buffer, trap, max_items)
 
-    # Log file
-    dt = datetime.now()
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as log_trap:
-            log_trap.write("\nTrap Received:")
-            log_trap.write(f"\n  Datetime: {dt}")
-            log_trap.write(f"\n  SRC: {src_ip}:{src_port}")
-            log_trap.write(f"\n  COMMUNITY: {community}")
-            for vb in trap["oids"]:
-                log_trap.write(f"\n  {vb['oid']} = {vb['value']}")
-            log_trap.write("\n")
-            log_trap.flush()
+        dispatch_integrations(trap)
     except Exception as e:
-        print(f"[LOG ERROR] {e} (cwd={os.getcwd()}, abs={os.path.abspath(LOG_FILE)})")
-
-    print(f"Trap recibido (buffer={len(buffer)}) SRC={src_ip}:{src_port} COMMUNITY={community}")
-
+        print(f"[DISPATCH ERROR] {e}")
 
 # ================== SNMP SERVER (PROCESS) ==================
-def start_snmp_server(shared_buffer, listen_ip: str, listen_port: int, max_items: int) -> None:
+def start_snmp_server(
+    shared_buffer,
+    dpa_active_issues,
+    dpa_recent_events,
+    listen_ip: str,
+    listen_port: int,
+    max_items: int,
+) -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    configure_store(dpa_active_issues, dpa_recent_events)
 
     snmpEngine = engine.SnmpEngine()
     _register_observer_compat(snmpEngine, _peer_observer, "rfc3412.receiveMessage:request")
@@ -314,9 +352,10 @@ def start_snmp_server(shared_buffer, listen_ip: str, listen_port: int, max_items
     # Comunidades permitidas (v1/v2c)
     config.add_v1_system(snmpEngine, "public", "public")
     config.add_v1_system(snmpEngine, "TACTest", "TACTest")
-    config.add_v1_system(snmpEngine, 'WIU', 'ALSTOM SNMP')
-    config.add_v1_system(snmpEngine, 'WIU-2', 'ALSTOM SNMP Trap')
-    config.add_v1_system(snmpEngine, 'DAU', 'helloworld')
+    config.add_v1_system(snmpEngine, "WIU", "ALSTOM SNMP")
+    config.add_v1_system(snmpEngine, "WIU-2", "ALSTOM SNMP Trap")
+    config.add_v1_system(snmpEngine, "DAU", "helloworld")
+    config.add_v1_system(snmpEngine, "dpa_test", "dpa_test")
     ##config.add_v1_system(snmpEngine, 'router', 'public')
 
     config.add_transport(
@@ -342,8 +381,6 @@ def start_snmp_server(shared_buffer, listen_ip: str, listen_port: int, max_items
             snmpEngine.transport_dispatcher.close_dispatcher()
         except Exception:
             pass
-
-
 # ================== WEB UI ==================
 HTML_BASE = """
 <!DOCTYPE html>
@@ -353,7 +390,7 @@ HTML_BASE = """
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{{ title }}</title>
   <style>
-    :root { --bg:#0f172a; --panel:#111c33; --border:#334155; --text:#e5e7eb; --muted:#94a3b8; --danger:#fb7185; }
+    :root { --bg:#0f172a; --panel:#111c33; --border:#334155; --text:#e5e7eb; --muted:#94a3b8; --danger:#fb7185; --ok:#4ade80; --warn:#fbbf24; --info:#38bdf8; }
     body { margin:0; font-family: Arial, sans-serif; background:var(--bg); color:var(--text) }
     .nav { position:sticky; top:0; background:rgba(15,23,42,.92); border-bottom:1px solid var(--border); padding:12px; display:flex; gap:14px; align-items:center; flex-wrap: wrap; }
     .nav a { color:var(--text); text-decoration:none; padding:6px 10px; border-radius:8px; border:1px solid transparent }
@@ -368,15 +405,19 @@ HTML_BASE = """
     .meta { color:var(--muted); margin-bottom: 6px; }
     .card { border:1px solid var(--border); background:rgba(17,28,51,.7); padding:12px; border-radius:12px; margin-bottom:12px }
     table { width:100%; border-collapse:collapse; }
-    th, td { text-align:left; padding:8px; border-bottom:1px solid rgba(51,65,85,.5); }
+    th, td { text-align:left; padding:8px; border-bottom:1px solid rgba(51,65,85,.5); vertical-align: top; }
     th { color: var(--muted); font-weight: 600; }
     .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
     .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.85rem; border:1px solid rgba(148,163,184,.35); color:var(--muted); }
     .badge.alert { border-color: rgba(251,113,133,.6); color: var(--danger); }
+    .badge.ok { border-color: rgba(74,222,128,.5); color: var(--ok); }
+    .badge.warn { border-color: rgba(251,191,36,.5); color: var(--warn); }
+    .badge.info { border-color: rgba(56,189,248,.5); color: var(--info); }
     .small { color: var(--muted); font-size:.9rem; }
     .btn { display:inline-block; padding:8px 10px; border-radius:10px; border:1px solid var(--border); text-decoration:none; color:var(--text); background:rgba(51,65,85,.25) }
     .btn:hover { border-color:rgba(56,189,248,.6); background:rgba(56,189,248,.10) }
+    .empty { color: var(--muted); padding: 10px 0; }
   </style>
 </head>
 <body>
@@ -385,6 +426,7 @@ HTML_BASE = """
     <a href="/observability" class="{{ 'active' if active=='obs' else '' }}">Observabilidad</a>
     <a href="/export" class="{{ 'active' if active=='export' else '' }}">Exportar</a>
     <a href="/system" class="{{ 'active' if active=='system' else '' }}">Sistema</a>
+    <a href="/integrations" class="{{ 'active' if active=='integrations' else '' }}">Integraciones</a>
     <div class="spacer"></div>
     <div class="pill">Buffer: {{ buffer_len }}/{{ buffer_max }}</div>
   </div>
@@ -600,6 +642,128 @@ SYSTEM_BODY = """
 </div>
 """
 
+INTEGRATIONS_BODY = """
+<div class="card">
+  <div class="small">
+    Módulos de integración registrados en ARGUS.
+    Esta vista es la base para mostrar active alerts, health y últimas acciones por integración.
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="oid" style="margin-bottom:8px"><b>Resumen</b></div>
+    <div id="integrationSummary" class="oid"></div>
+  </div>
+
+  <div class="card">
+    <div class="oid" style="margin-bottom:8px"><b>Health</b></div>
+    <table>
+      <thead><tr><th>Integración</th><th>Status</th><th>Detalle</th></tr></thead>
+      <tbody id="integrationHealth"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="oid" style="margin-bottom:8px"><b>DPA - Active Alerts</b></div>
+  <table>
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>Issue Key</th>
+        <th>Severity</th>
+        <th>Source IP</th>
+        <th>DB Instance</th>
+        <th>Alert Name</th>
+        <th>Last Seen</th>
+      </tr>
+    </thead>
+    <tbody id="dpaActiveAlerts"></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <div class="oid" style="margin-bottom:8px"><b>DPA - Últimos eventos</b></div>
+  <table>
+    <thead>
+      <tr>
+        <th>Timestamp</th>
+        <th>Action</th>
+        <th>Issue Key</th>
+        <th>Severity</th>
+        <th>Destino</th>
+      </tr>
+    </thead>
+    <tbody id="dpaRecentEvents"></tbody>
+  </table>
+</div>
+
+<script>
+function esc(s){ return (s ?? '').toString().replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+
+function renderEmptyRow(colspan, text) {
+  return `<tr><td class="empty oid" colspan="${colspan}">${esc(text)}</td></tr>`;
+}
+
+async function loadIntegrations() {
+  const [summaryR, activeR] = await Promise.all([
+    fetch('/api/integrations/summary'),
+    fetch('/api/integrations/dpa/active-alerts')
+  ]);
+
+  const summary = await summaryR.json();
+  const active = await activeR.json();
+
+  document.getElementById('integrationSummary').innerHTML =
+    `Integraciones registradas: ${esc(summary.total_integrations)}<br/>` +
+    `DPA habilitada: ${esc(summary.dpa_enabled)}<br/>` +
+    `Probe API configurado: ${esc(summary.probe_api_enabled)}<br/>` +
+    `Active alerts DPA: ${esc(summary.dpa_active_alerts)}`;
+
+  document.getElementById('integrationHealth').innerHTML =
+    (summary.health || []).map(x => `
+      <tr>
+        <td class="oid">${esc(x.name)}</td>
+        <td class="oid">${esc(x.status)}</td>
+        <td class="oid">${esc(x.detail)}</td>
+      </tr>
+    `).join('') || renderEmptyRow(3, 'Sin información de health');
+
+  document.getElementById('dpaActiveAlerts').innerHTML =
+    ((active.items || []).length
+      ? (active.items || []).map(x => `
+        <tr>
+          <td class="oid">${esc(x.status)}</td>
+          <td class="oid">${esc(x.issue_key)}</td>
+          <td class="oid">${esc(x.severity)}</td>
+          <td class="oid">${esc(x.source_ip)}</td>
+          <td class="oid">${esc(x.db_instance)}</td>
+          <td class="oid">${esc(x.alert_name)}</td>
+          <td class="oid">${esc(x.last_seen)}</td>
+        </tr>
+      `).join('')
+      : renderEmptyRow(7, 'Sin active alerts DPA todavía'));
+
+  document.getElementById('dpaRecentEvents').innerHTML =
+    ((active.recent_events || []).length
+      ? (active.recent_events || []).map(x => `
+        <tr>
+          <td class="oid">${esc(x.timestamp)}</td>
+          <td class="oid">${esc(x.action)}</td>
+          <td class="oid">${esc(x.issue_key)}</td>
+          <td class="oid">${esc(x.severity)}</td>
+          <td class="oid">${esc(x.target)}</td>
+        </tr>
+      `).join('')
+      : renderEmptyRow(5, 'Sin eventos recientes DPA todavía'));
+}
+
+setInterval(loadIntegrations, 5000);
+loadIntegrations();
+</script>
+"""
+
 
 # ================== FLASK APP ==================
 def create_app() -> Flask:
@@ -653,6 +817,47 @@ def create_app() -> Flask:
             data_dir=os.path.abspath(DATA_DIR),
             log_path=os.path.abspath(LOG_FILE),
         )
+    
+    @app.route("/api/integrations/dpa/active-alerts")
+    def api_dpa_active_alerts():
+        return jsonify(
+            {
+                "items": get_active_issues(),
+                "recent_events": get_recent_events(),
+            }
+        )
+
+    
+    @app.route("/api/integrations/dpa/events")
+    def api_dpa_events():
+        return jsonify(get_recent_events())
+
+    @app.route("/api/integrations/summary")
+    def api_integrations_summary():
+        summary = get_summary()
+
+        return jsonify(
+            {
+                "total_integrations": 1,
+                "dpa_enabled": True,
+                "probe_api_enabled": False,
+                "dpa_active_alerts": summary["active_count"],
+                "health": [
+                    {"name": "dpa", "status": "READY", "detail": "Memory store conectado"},
+                    {"name": "probe_api", "status": "PENDING", "detail": "Aún no configurado"},
+                    {"name": "mssql", "status": "PENDING", "detail": "Sin repositorio conectado"},
+                ],
+            }
+        )
+
+    @app.route("/integrations")
+    def integrations_page():
+        return render_page(
+            "Integraciones",
+            "Integraciones",
+            "integrations",
+            INTEGRATIONS_BODY,
+        )
 
     @app.route("/system/clear")
     def system_clear():
@@ -663,6 +868,8 @@ def create_app() -> Flask:
             except Exception:
                 while len(traps_buffer) > 0:
                     traps_buffer.pop(0)
+
+        clear_all()
 
         return render_page(
             "Sistema",
@@ -720,7 +927,6 @@ def create_app() -> Flask:
 def main() -> None:
     global traps_buffer
 
-    # Forzar directorio de logs/data
     _ensure_dir(DATA_DIR)
 
     try:
@@ -729,11 +935,24 @@ def main() -> None:
         pass
 
     manager = mp.Manager()
+
     traps_buffer = manager.list()
+
+    dpa_active_issues = manager.dict()
+    dpa_recent_events = manager.list()
+
+    configure_store(dpa_active_issues, dpa_recent_events)
 
     snmp_proc = mp.Process(
         target=start_snmp_server,
-        args=(traps_buffer, SNMP_LISTEN_IP, SNMP_PORT, MAX_TRAPS),
+        args=(
+            traps_buffer,
+            dpa_active_issues,
+            dpa_recent_events,
+            SNMP_LISTEN_IP,
+            SNMP_PORT,
+            MAX_TRAPS,
+        ),
         daemon=True,
     )
     snmp_proc.start()
@@ -741,7 +960,6 @@ def main() -> None:
     app = create_app()
     print(f"Web UI disponible en http://{WEB_HOST}:{WEB_PORT}")
     app.run(host=WEB_HOST, port=WEB_PORT, threaded=False)
-
 
 if __name__ == "__main__":
     mp.freeze_support()

@@ -1,0 +1,55 @@
+Qué significa cada campo
+
+source_ip
+
+IP origen del trap
+
+community
+
+comunidad SNMP recibida
+
+timestamp
+
+timestamp de ARGUS, no el de DPA
+
+db_instance_raw
+
+valor completo del OID 1.3.6.1.4.1.22980.1.1
+
+ejemplo: KCTACTOOLSD03\SQLEXPRESS
+
+server_name
+
+nombre del server parseado desde db_instance_raw
+
+ejemplo: KCTACTOOLSD03
+
+instance_name
+
+nombre de la instancia parseada
+
+ejemplo: SQLEXPRESS
+
+alert_name
+
+nombre de la alerta
+
+alert_status_raw
+
+valor original del status
+
+ejemplo: HIGH, NORMAL, WARNING
+
+alert_time_text
+
+texto de fecha/hora que manda DPA
+
+query_result
+
+valor del OID 1.3.6.1.4.1.22980.1.8
+
+lo dejamos como str
+
+raw_oids
+
+diccionario completo OID → valor
