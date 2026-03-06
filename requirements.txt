@@ -1,2 +1,5 @@
 pysnmp
 flask
+requests
+pywin32
+python-dotenv

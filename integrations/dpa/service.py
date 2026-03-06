@@ -2,6 +2,7 @@ from typing import Any, Dict
 
 from integrations.dpa.parser import parse_dpa_trap, build_dpa_issue
 from integrations.dpa.memory_store import upsert_issue, close_issue
+from integrations.dpa.dynatrace_sender import send_event
 
 
 REQUIRED_DPA_OIDS = {
@@ -38,9 +39,40 @@ def handle_dpa_trap(trap: Dict[str, Any]) -> None:
     if issue.status == "OPEN":
         action = upsert_issue(issue)
         print(f"[DPA] Active alert {action} en memoria")
+
+        if action in {"OPEN", "UPDATE"}:
+            send_event(issue)
+
     else:
         action = close_issue(issue)
         print(f"[DPA] Active alert {action} en memoria")
+
+        if action == "CLOSE":
+            send_event(issue)
+
+    print(f"[DPA] issue_key={issue.issue_key}")
+    print(f"[DPA] status={issue.status}")
+    print(f"[DPA] severity={issue.severity}")
+    print(f"[DPA] server_name={issue.server_name}")
+    print(f"[DPA] instance_name={issue.instance_name}")
+
+    parsed = parse_dpa_trap(trap)
+    issue = build_dpa_issue(parsed)
+
+    if issue.status == "OPEN":
+        action = upsert_issue(issue)
+
+        print(f"[DPA] Active alert {action} en memoria")
+
+        if action == "OPEN":
+            send_event(issue)
+    else:
+        action = close_issue(issue)
+
+        print(f"[DPA] Active alert {action} en memoria")
+
+        if action == "CLOSE":
+            send_event(issue)
 
     print(f"[DPA] issue_key={issue.issue_key}")
     print(f"[DPA] status={issue.status}")
