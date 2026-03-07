@@ -3,7 +3,18 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from integrations.solarwinds.parser import parse_solarwinds_trap
-from integrations.solarwinds.repository import save_solarwinds_trap
+from integrations.solarwinds.repository import (
+    save_solarwinds_trap,
+    list_solarwinds_traps,
+    list_solarwinds_traps_since,
+)
+
+def get_solarwinds_traps(limit: int = 100) -> list[dict]:
+    return list_solarwinds_traps(limit=limit)
+
+
+def get_solarwinds_traps_since(last_trap_id: int, limit: int = 100) -> list[dict]:
+    return list_solarwinds_traps_since(last_trap_id=last_trap_id, limit=limit)
 
 
 def handle_solarwinds_trap(trap: Dict[str, Any]) -> None:

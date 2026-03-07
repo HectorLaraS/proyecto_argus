@@ -49,3 +49,89 @@ def save_solarwinds_trap(parsed: SolarWindsTrapParsed) -> None:
     except Exception as exc:
         print("[SOLARWINDS][DB ERROR]")
         print(exc)
+
+def list_solarwinds_traps(limit: int = 100) -> list[dict]:
+    sql = """
+    SELECT TOP (?)
+        trap_id,
+        received_at,
+        src_ip,
+        src_port,
+        community,
+        enterprise_oid,
+        trap_oid,
+        vendor_name,
+        raw_payload_json,
+        created_at
+    FROM dbo.sw_traps
+    ORDER BY trap_id DESC
+    """
+
+    items: list[dict] = []
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, limit)
+            rows = cur.fetchall()
+
+            for row in rows:
+                items.append(
+                    {
+                        "trap_id": row.trap_id,
+                        "received_at": str(row.received_at),
+                        "src_ip": row.src_ip,
+                        "src_port": row.src_port,
+                        "community": row.community,
+                        "enterprise_oid": row.enterprise_oid,
+                        "trap_oid": row.trap_oid,
+                        "vendor_name": row.vendor_name,
+                        "raw_payload_json": row.raw_payload_json,
+                        "created_at": str(row.created_at),
+                    }
+                )
+
+    return items
+
+
+def list_solarwinds_traps_since(last_trap_id: int, limit: int = 100) -> list[dict]:
+    sql = """
+    SELECT TOP (?)
+        trap_id,
+        received_at,
+        src_ip,
+        src_port,
+        community,
+        enterprise_oid,
+        trap_oid,
+        vendor_name,
+        raw_payload_json,
+        created_at
+    FROM dbo.sw_traps
+    WHERE trap_id > ?
+    ORDER BY trap_id ASC
+    """
+
+    items: list[dict] = []
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, limit, last_trap_id)
+            rows = cur.fetchall()
+
+            for row in rows:
+                items.append(
+                    {
+                        "trap_id": row.trap_id,
+                        "received_at": str(row.received_at),
+                        "src_ip": row.src_ip,
+                        "src_port": row.src_port,
+                        "community": row.community,
+                        "enterprise_oid": row.enterprise_oid,
+                        "trap_oid": row.trap_oid,
+                        "vendor_name": row.vendor_name,
+                        "raw_payload_json": row.raw_payload_json,
+                        "created_at": str(row.created_at),
+                    }
+                )
+
+    return items
