@@ -51,6 +51,11 @@ from integrations.dpa.memory_store import (
     get_summary,
 )
 
+from integrations.solarwinds.service import (
+    get_solarwinds_traps,
+    get_solarwinds_traps_since,
+)
+
 load_dotenv()
 
 
@@ -786,6 +791,39 @@ def create_app() -> Flask:
     @app.route("/")
     def index():
         return render_page("Live", "Traps (Live) - Mem", "live", LIVE_BODY)
+    
+    @app.route("/api/integrations/solarwinds/traps")
+    def api_solarwinds_traps():
+        limit = int(request.args.get("limit") or 100)
+        limit = max(1, min(limit, 500))
+
+        items = get_solarwinds_traps(limit=limit)
+
+        return jsonify(
+            {
+                "items": items,
+                "count": len(items),
+            }
+        )
+
+
+    @app.route("/api/integrations/solarwinds/traps/updates")
+    def api_solarwinds_trap_updates():
+        last_trap_id = int(request.args.get("last_trap_id") or 0)
+        limit = int(request.args.get("limit") or 100)
+
+        last_trap_id = max(0, last_trap_id)
+        limit = max(1, min(limit, 500))
+
+        items = get_solarwinds_traps_since(last_trap_id=last_trap_id, limit=limit)
+
+        return jsonify(
+            {
+                "items": items,
+                "count": len(items),
+                "last_trap_id": items[-1]["trap_id"] if items else last_trap_id,
+            }
+        )
 
     @app.route("/observability")
     def observability_page():
