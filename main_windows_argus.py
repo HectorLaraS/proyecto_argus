@@ -67,28 +67,21 @@ MAX_TRAPS = 200
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 5010
 
-# Directorio fijo para Windows (tu ruta)
 PROJECT_ROOT = os.getenv("PROJECT_ROOT_PATH") or os.getcwd()
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-
-# Log dentro de data para evitar problemas con cwd
 LOG_FILE = os.path.join(DATA_DIR, "traps_received.log")
 
-DEBUG_OBSERVER_ONCE = False  # True => imprime keys del observer una vez
+DEBUG_OBSERVER_ONCE = False
 
-# Observabilidad
 RATE_WINDOW_MINUTES = 15
 
-# Burst detection
 BURST_WINDOW_SECONDS = 60
 BURST_THRESHOLD = 20
 BURST_TOP = 10
 
-
 traps_buffer: Optional[Any] = None
 WEB_START_EPOCH = time.time()
 
-# (src_ip, src_port, community) visto por observer
 _LAST_PEER: Tuple[str, Optional[int], str] = ("", None, "")
 
 
@@ -280,12 +273,6 @@ def _peer_observer(snmpEngine, execPoint, variables, cbCtx):
 
 
 def process_trap_general(buffer: Any, trap: Dict[str, Any], max_items: int) -> None:
-    """
-    Flujo principal actual de ARGUS:
-    - guardar en buffer
-    - escribir log
-    - imprimir en consola
-    """
     _buffer_insert_front(buffer, trap, max_items)
 
     dt = datetime.now()
@@ -337,6 +324,7 @@ def trap_callback(snmpEngine, stateReference, contextEngineId, contextName, varB
     except Exception as e:
         print(f"[DISPATCH ERROR] {e}")
 
+
 # ================== SNMP SERVER (PROCESS) ==================
 def start_snmp_server(
     shared_buffer,
@@ -354,14 +342,12 @@ def start_snmp_server(
     snmpEngine = engine.SnmpEngine()
     _register_observer_compat(snmpEngine, _peer_observer, "rfc3412.receiveMessage:request")
 
-    # Comunidades permitidas (v1/v2c)
     config.add_v1_system(snmpEngine, "public", "public")
     config.add_v1_system(snmpEngine, "TACTest", "TACTest")
     config.add_v1_system(snmpEngine, "WIU", "ALSTOM SNMP")
     config.add_v1_system(snmpEngine, "WIU-2", "ALSTOM SNMP Trap")
     config.add_v1_system(snmpEngine, "DAU", "helloworld")
     config.add_v1_system(snmpEngine, "dpa_test", "dpa_test")
-    ##config.add_v1_system(snmpEngine, 'router', 'public')
 
     config.add_transport(
         snmpEngine,
@@ -386,6 +372,8 @@ def start_snmp_server(
             snmpEngine.transport_dispatcher.close_dispatcher()
         except Exception:
             pass
+
+
 # ================== WEB UI ==================
 HTML_BASE = """
 <!DOCTYPE html>
@@ -403,7 +391,7 @@ HTML_BASE = """
     .nav a.active { border-color:rgba(56,189,248,.6); background:rgba(56,189,248,.12) }
     .spacer { flex: 1; }
     .pill { color:var(--muted); border:1px solid var(--border); padding:6px 10px; border-radius:999px; font-size:.85rem }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 16px }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 16px }
     .trap { border:1px solid var(--border); margin:8px 0; padding:10px; border-radius:10px; background:rgba(15,23,42,.35) }
     .time { color:var(--muted); font-size:.9em; margin-bottom:6px }
     .oid { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace }
@@ -704,11 +692,90 @@ INTEGRATIONS_BODY = """
   </table>
 </div>
 
+<div class="card">
+  <div class="oid" style="margin-bottom:8px"><b>SolarWinds - Traps</b></div>
+  <div class="small" style="margin-bottom:10px">
+    Últimos traps almacenados en MSSQL. Refresh incremental cada 5s.
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Received At</th>
+        <th>Source IP</th>
+        <th>Community</th>
+        <th>Enterprise OID</th>
+        <th>Trap OID</th>
+        <th>Vendor</th>
+      </tr>
+    </thead>
+    <tbody id="solarwindsTraps"></tbody>
+  </table>
+</div>
+
 <script>
 function esc(s){ return (s ?? '').toString().replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
 
 function renderEmptyRow(colspan, text) {
   return `<tr><td class="empty oid" colspan="${colspan}">${esc(text)}</td></tr>`;
+}
+
+let lastSolarwindsTrapId = 0;
+
+function renderSolarwindsRows(items) {
+  return items.map(x => `
+    <tr data-trap-id="${esc(x.trap_id)}">
+      <td class="oid">${esc(x.trap_id)}</td>
+      <td class="oid">${esc(x.received_at)}</td>
+      <td class="oid">${esc(x.src_ip)}</td>
+      <td class="oid">${esc(x.community)}</td>
+      <td class="oid">${esc(x.enterprise_oid)}</td>
+      <td class="oid">${esc(x.trap_oid)}</td>
+      <td class="oid">${esc(x.vendor_name)}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadSolarwindsInitial() {
+  const r = await fetch('/api/integrations/solarwinds/traps?limit=100');
+  const data = await r.json();
+
+  const body = document.getElementById('solarwindsTraps');
+  const items = data.items || [];
+
+  if (!items.length) {
+    body.innerHTML = renderEmptyRow(7, 'Sin traps SolarWinds todavía');
+    lastSolarwindsTrapId = 0;
+    return;
+  }
+
+  body.innerHTML = renderSolarwindsRows(items);
+  lastSolarwindsTrapId = Math.max(...items.map(x => Number(x.trap_id) || 0));
+}
+
+async function loadSolarwindsUpdates() {
+  const r = await fetch(`/api/integrations/solarwinds/traps/updates?last_trap_id=${lastSolarwindsTrapId}&limit=100`);
+  const data = await r.json();
+
+  const items = data.items || [];
+  if (!items.length) {
+    return;
+  }
+
+  const body = document.getElementById('solarwindsTraps');
+
+  if (body.innerText.includes('Sin traps SolarWinds todavía')) {
+    body.innerHTML = '';
+  }
+
+  const rowsHtml = renderSolarwindsRows([...items].reverse());
+  body.insertAdjacentHTML('afterbegin', rowsHtml);
+
+  lastSolarwindsTrapId = Number(data.last_trap_id || lastSolarwindsTrapId);
+
+  while (body.rows.length > 100) {
+    body.deleteRow(body.rows.length - 1);
+  }
 }
 
 async function loadIntegrations() {
@@ -724,7 +791,8 @@ async function loadIntegrations() {
     `Integraciones registradas: ${esc(summary.total_integrations)}<br/>` +
     `DPA habilitada: ${esc(summary.dpa_enabled)}<br/>` +
     `Probe API configurado: ${esc(summary.probe_api_enabled)}<br/>` +
-    `Active alerts DPA: ${esc(summary.dpa_active_alerts)}`;
+    `Active alerts DPA: ${esc(summary.dpa_active_alerts)}<br/>` +
+    `SolarWinds traps visibles: ${esc(summary.solarwinds_enabled)}`;
 
   document.getElementById('integrationHealth').innerHTML =
     (summary.health || []).map(x => `
@@ -762,6 +830,12 @@ async function loadIntegrations() {
         </tr>
       `).join('')
       : renderEmptyRow(5, 'Sin eventos recientes DPA todavía'));
+
+  if (lastSolarwindsTrapId === 0) {
+    await loadSolarwindsInitial();
+  } else {
+    await loadSolarwindsUpdates();
+  }
 }
 
 setInterval(loadIntegrations, 5000);
@@ -791,7 +865,7 @@ def create_app() -> Flask:
     @app.route("/")
     def index():
         return render_page("Live", "Traps (Live) - Mem", "live", LIVE_BODY)
-    
+
     @app.route("/api/integrations/solarwinds/traps")
     def api_solarwinds_traps():
         limit = int(request.args.get("limit") or 100)
@@ -805,7 +879,6 @@ def create_app() -> Flask:
                 "count": len(items),
             }
         )
-
 
     @app.route("/api/integrations/solarwinds/traps/updates")
     def api_solarwinds_trap_updates():
@@ -855,7 +928,7 @@ def create_app() -> Flask:
             data_dir=os.path.abspath(DATA_DIR),
             log_path=os.path.abspath(LOG_FILE),
         )
-    
+
     @app.route("/api/integrations/dpa/active-alerts")
     def api_dpa_active_alerts():
         return jsonify(
@@ -865,7 +938,6 @@ def create_app() -> Flask:
             }
         )
 
-    
     @app.route("/api/integrations/dpa/events")
     def api_dpa_events():
         return jsonify(get_recent_events())
@@ -876,14 +948,16 @@ def create_app() -> Flask:
 
         return jsonify(
             {
-                "total_integrations": 1,
+                "total_integrations": 2,
                 "dpa_enabled": True,
+                "solarwinds_enabled": True,
                 "probe_api_enabled": False,
                 "dpa_active_alerts": summary["active_count"],
                 "health": [
                     {"name": "dpa", "status": "READY", "detail": "Memory store conectado"},
+                    {"name": "solarwinds", "status": "READY", "detail": "Repository MSSQL conectado"},
                     {"name": "probe_api", "status": "PENDING", "detail": "Aún no configurado"},
-                    {"name": "mssql", "status": "PENDING", "detail": "Sin repositorio conectado"},
+                    {"name": "mssql", "status": "READY", "detail": "Lectura/escritura habilitada"},
                 ],
             }
         )
@@ -998,6 +1072,7 @@ def main() -> None:
     app = create_app()
     print(f"Web UI disponible en http://{WEB_HOST}:{WEB_PORT}")
     app.run(host=WEB_HOST, port=WEB_PORT, threaded=False)
+
 
 if __name__ == "__main__":
     mp.freeze_support()
